@@ -352,55 +352,10 @@ st.title("Зам тээврийн ослуудын шинжилгээ (2022-2024
 
 st.header("5. Ирээдүйн ослын таамаглал (Олон ML/DL загвар)")
 st.write("13 төрлийн ML/DL/ANN/NN моделийн таамаглалыг нэг дор үзүүлнэ.")
-estimators = [
-    ("rf", RandomForestRegressor(n_estimators=50)),
-    ("ridge", Ridge()),
-    ("dt", DecisionTreeRegressor()),
-]
 
-# -- Voting (external model-ууд оруулах боломжтой fallback)
-voting_estimators = [
-    ("rf", RandomForestRegressor()),
-    ("ridge", Ridge()),
-    ("xgb", XGBRegressor(verbosity=0)),
-    ("cat", CatBoostRegressor(verbose=0)),
-]
-
-MODEL_LIST = [
-    ("LinearRegression", LinearRegression()),
-    ("Ridge", Ridge()),
-    ("Lasso", Lasso()),
-    ("DecisionTree", DecisionTreeRegressor(random_state=42)),
-    ("RandomForest", RandomForestRegressor(random_state=42)),
-    ("ExtraTrees", ExtraTreesRegressor(random_state=42)),
-    ("GradientBoosting", GradientBoostingRegressor(random_state=42)),
-    ("HistGB", HistGradientBoostingRegressor(random_state=42)),
-    ("AdaBoost", AdaBoostRegressor(random_state=42)),
-    ("KNeighbors", KNeighborsRegressor()),
-    ("SVR", SVR()),  # random_state байхгүй
-    (
-        "MLPRegressor",
-        MLPRegressor(hidden_layer_sizes=(64, 32), max_iter=1000, random_state=42),
-    ),
-    ("ElasticNet", ElasticNet()),
-    ("XGBRegressor", XGBRegressor(verbosity=0, random_state=42)),
-    ("CatBoostRegressor", CatBoostRegressor(verbose=0, random_state=42)),
-    ("LGBMRegressor", LGBMRegressor(random_state=42)),
-    (
-        "Stacking",
-        StackingRegressor(
-            estimators=estimators,
-            final_estimator=LinearRegression(),
-            passthrough=False,
-            cv=5,
-            n_jobs=-1,
-        ),
-    ),
-    # -- Voting (external боломжтой)
-]
 
 # --- Үндсэн хувьсагчид
-forecast_col = "Осол"
+
 weather_cols = [
     "ГБХ: бусад зөрчил",
     "анхаарал болгоомжгүй зөрчил",
@@ -587,6 +542,53 @@ weather_cols = [
     "Авто зам - Ослын нөхцөл Гурав бас түүнээс дээш тээврийн хэрэгсэл холбогдсон осол",
 ]
 
+estimators = [
+    ("rf", RandomForestRegressor(n_estimators=50)),
+    ("ridge", Ridge()),
+    ("dt", DecisionTreeRegressor()),
+]
+
+# -- Voting (external model-ууд оруулах боломжтой fallback)
+voting_estimators = [
+    ("rf", RandomForestRegressor()),
+    ("ridge", Ridge()),
+    ("xgb", XGBRegressor(verbosity=0)),
+    ("cat", CatBoostRegressor(verbose=0)),
+]
+
+MODEL_LIST = [
+    ("LinearRegression", LinearRegression()),
+    ("Ridge", Ridge()),
+    ("Lasso", Lasso()),
+    ("DecisionTree", DecisionTreeRegressor(random_state=42)),
+    ("RandomForest", RandomForestRegressor(random_state=42)),
+    ("ExtraTrees", ExtraTreesRegressor(random_state=42)),
+    ("GradientBoosting", GradientBoostingRegressor(random_state=42)),
+    ("HistGB", HistGradientBoostingRegressor(random_state=42)),
+    ("AdaBoost", AdaBoostRegressor(random_state=42)),
+    ("KNeighbors", KNeighborsRegressor()),
+    ("SVR", SVR()),  # random_state байхгүй
+    (
+        "MLPRegressor",
+        MLPRegressor(hidden_layer_sizes=(64, 32), max_iter=1000, random_state=42),
+    ),
+    ("ElasticNet", ElasticNet()),
+    ("XGBRegressor", XGBRegressor(verbosity=0, random_state=42)),
+    ("CatBoostRegressor", CatBoostRegressor(verbose=0, random_state=42)),
+    ("LGBMRegressor", LGBMRegressor(random_state=42)),
+    (
+        "Stacking",
+        StackingRegressor(
+            estimators=estimators,
+            final_estimator=LinearRegression(),
+            passthrough=False,
+            cv=5,
+            n_jobs=-1,
+        ),
+    ),
+    # -- Voting (external боломжтой)
+]
+forecast_col = "Осол"
 X = df[weather_cols].values
 y = df["Осол"].values
 
