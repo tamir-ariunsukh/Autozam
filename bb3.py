@@ -5,23 +5,43 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 import numpy as np
 from datetime import datetime
-
-
 import folium
 from streamlit_folium import st_folium
 import io
+import pandas as pd
+import numpy as np
+from sklearn.linear_model import LinearRegression, Ridge, Lasso
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor, AdaBoostRegressor, ExtraTreesRegressor
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.svm import SVR
+from sklearn.neural_network import MLPRegressor
+from xgboost import XGBRegressor
+from lightgbm import LGBMRegressor
+from catboost import CatBoostRegressor
+import tensorflow as tf
 
-# Setting page configuration for Streamlit
-st.set_page_config(page_title="Traffic Violations Analysis", layout="wide")
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+import plotly.express as px
 
 
-# Function to load and preprocess data
+st.set_page_config(page_title="С.Цолмон, А.Тамир нарын судалгаа 2025-06-11", layout="wide")
+
+
 @st.cache_data
 def load_data():
     df = pd.read_excel("output_onehot.xlsx")
 
-    # Selecting relevant columns based on user requirements
     columns = [
+        "Дугаар",
+        "Газар /Хэлтэс/",
+        "Зөрчил гарсан газрын хаяг",
+        "Замын байршил /тайлбар/",
+        "Дүүргийн нэр",
+        "Хорооны дугаар",
+        "Аймгийн нэр",
+        "Багийн дугаар",
+        "Сумын нэр",
         "Уртраг",
         "Өргөрөг",
         "Осол",
@@ -286,15 +306,26 @@ def plot_correlation_matrix(df, title, columns):
 
     corr_matrix = df_encoded.corr()
 
+    # Мөрийг эсрэг дарааллаар эрэмбэлэх
+    corr_matrix = corr_matrix.iloc[::-1]
+
     # Plotting heatmap
-    fig, ax = plt.subplots(figsize=(max(8, 1.5 * len(columns)), max(6, 1.2 * len(columns))))
+    fig, ax = plt.subplots(
+        figsize=(max(8, 1.5 * len(columns)), max(6, 1.2 * len(columns)))
+    )
     sns.heatmap(
-        corr_matrix, annot=True, cmap="coolwarm", vmin=-1, vmax=1, center=0, ax=ax, fmt=".3f"
+        corr_matrix,
+        annot=True,
+        cmap="coolwarm",
+        vmin=-1,
+        vmax=1,
+        center=0,
+        ax=ax,
+        fmt=".3f",
     )
     plt.title(title)
     plt.tight_layout()
     return fig
-
 
 
 # Loading data
@@ -303,9 +334,311 @@ df = load_data()
 # Streamlit app structure
 st.title("Зам тээврийн ослуудын шинжилгээ (2022-2024)")
 
+# ---------------------------------------
+# 5. Ирээдүйн ослын таамаглал (ANN, NN, DL, ML олон модел)
+# ---------------------------------------
+
+st.header("5. Ирээдүйн ослын таамаглал (Олон ML/DL загвар)")
+st.write("13 төрлийн ML/DL/ANN/NN моделийн таамаглалыг нэг дор үзүүлнэ.")
+
+# ----------- ТАЙЛБАР -----------
+# Моделийн нэрс:
+MODEL_LIST = [
+    ("LinearRegression", LinearRegression()),
+    ("Ridge", Ridge()),
+    ("Lasso", Lasso()),
+    ("DecisionTree", DecisionTreeRegressor()),
+    ("RandomForest", RandomForestRegressor()),
+    ("ExtraTrees", ExtraTreesRegressor()),
+    ("GradientBoosting", GradientBoostingRegressor()),
+    ("AdaBoost", AdaBoostRegressor()),
+    ("KNeighbors", KNeighborsRegressor()),
+    ("SVR", SVR()),
+    ("MLPRegressor", MLPRegressor(hidden_layer_sizes=(64, 32), max_iter=1000)),
+    ("XGBRegressor", XGBRegressor(verbosity=0)),
+   
+    ("CatBoostRegressor", CatBoostRegressor(verbose=0)),
+  
+]
+
+# ----------- Өгөгдөл бэлтгэх -----------
+# Жил, сар, өдрөөр ослын тоог нэгтгэх
+forecast_col = "Осол"
+grouped = df[df[forecast_col]==1].groupby(["Year", "Month"]).agg(osol_count=(forecast_col, "sum")).reset_index()
+# Прогноз хийхэд цаг хугацаа индекс болгоно
+grouped["date"] = pd.to_datetime(grouped[["Year", "Month"]].assign(DAY=1))
+grouped = grouped.sort_values("date").reset_index(drop=True)
+
+# Feature бэлтгэх
+n_lag =24 # 12 сараар лаг хийнэ (онцлог)
+for i in range(1, n_lag+1):
+    grouped[f"osol_lag_{i}"] = grouped["osol_count"].shift(i)
+grouped = grouped.dropna().reset_index(drop=True)
+
+# X, y
+X = grouped[[f"osol_lag_{i}" for i in range(1, n_lag+1)]].values
+y = grouped["osol_count"].values
+
+# TRAIN/TEST (last 12 months as test)
+train_size = int(len(X) * 0.8)
+X_train, y_train = X[:train_size], y[:train_size]
+X_test, y_test = X[train_size:], y[train_size:]
+
+# ------- Олон моделийн сургаж таамаглах (SKLearn) -------
+results = []
+y_preds = {}
+for name, model in MODEL_LIST:
+    model.fit(X_train, y_train)
+    y_pred = model.predict(X_test)
+    y_preds[name] = y_pred
+    mae = mean_absolute_error(y_test, y_pred)
+    mse = mean_squared_error(y_test, y_pred)
+    rmse = np.sqrt(mse)
+    r2 = r2_score(y_test, y_pred)
+    results.append({"Model": name, "MAE": mae, "RMSE": rmse, "R2": r2})
+
+
+
+# ----------- Метрик харуулах, Excel рүү татах -----------
+
+results_df = pd.DataFrame(results)
+st.dataframe(results_df)
+
+# Excel татах
+excel_buffer = pd.ExcelWriter("model_metrics.xlsx", engine="xlsxwriter")
+results_df.to_excel(excel_buffer, index=False)
+excel_buffer.close()
+
+with open("model_metrics.xlsx", "rb") as f:
+    st.download_button(
+        label="Моделийн метрик Excel татах",
+        data=f,
+        file_name="model_metrics.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+# ----------- Ирээдүйн 30, 90, 180, 365 хоногийн прогноз -----------
+def forecast_next(model, last_values, steps=12):
+    preds = []
+    input_seq = last_values.copy()
+    for _ in range(steps):
+        pred = model.predict([input_seq])[0]
+        preds.append(pred)
+        input_seq = np.roll(input_seq, -1)
+        input_seq[-1] = pred
+    return preds
+
+
+
+# Бүх моделийн ирээдүйн прогноз хадгалах
+model_forecasts = {}
+
+last_seq = X_test[-1]  # хамгийн сүүлийн үеийн 12 сар
+
+for name, model in MODEL_LIST:
+    preds_dict = {}
+    forecast_steps = {"30 хоног": 1, "90 хоног": 3, "180 хоног": 6, "365 хоног": 12}
+
+    for k, s in forecast_steps.items():
+        preds_dict[k] = forecast_next(model, last_seq, steps=s)
+    model_forecasts[name] = preds_dict
+
+
+
+# --- 1. Test set дээрх бодит болон таамагласан ослын тоо (модел бүрээр) ---
+test_dates = grouped["date"].iloc[-len(X_test):].values
+test_true = y_test
+
+test_preds_df = pd.DataFrame({'date': test_dates, 'real': test_true})
+for name in MODEL_LIST:
+    test_preds_df[name[0]] = y_preds[name[0]]
+
+# --- 2. Ирээдүйн forecast (12 сар) модель бүрээр ---
+forecast_steps = {"30 хоног": 1, "90 хоног": 3, "180 хоног": 6, "365 хоног": 12}
+last_seq = X_test[-1]
+
+future_dates = pd.date_range(start=grouped["date"].iloc[-1]+pd.offsets.MonthBegin(), periods=12, freq="MS")
+future_preds_df = pd.DataFrame({'date': future_dates})
+for name, model in MODEL_LIST:
+    preds = forecast_next(model, last_seq, steps=12)
+    future_preds_df[name] = preds
+
+# --- 3. Excel файлд export хийх (хоёр sheet-тэй: test болон ирээдүй) ---
+with pd.ExcelWriter("model_predictions.xlsx", engine="xlsxwriter") as writer:
+    test_preds_df.to_excel(writer, index=False, sheet_name="Test_Predictions")
+    future_preds_df.to_excel(writer, index=False, sheet_name="Future_Predictions")
+
+# --- 4. Streamlit-р Excel татуулах ---
+with open("model_predictions.xlsx", "rb") as f:
+    st.download_button(
+        label="Test/Forecast бүх моделийн таамаглалуудыг Excel-р татах",
+        data=f,
+        file_name="model_predictions.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+# --- 5. Streamlit дээр харагдах preview (жишээ нь тестийн эхний 10 мөр) ---
+st.subheader("Test датан дээрх модел бүрийн бодит болон таамагласан утгууд:")
+st.dataframe(test_preds_df.head(10))
+
+st.subheader("Ирээдүйн 12 сарын прогноз (модел бүрээр):")
+st.dataframe(future_preds_df)
+
+
+# ----------- 1 жилийн прогноз график (модел сонгох) -----------
+st.subheader("1 жилийн прогноз график (модел бүрээр):")
+selected_model = st.selectbox("Модель сонгох:", list(model_forecasts.keys()))
+future = model_forecasts[selected_model]["365 хоног"]
+dates_future = pd.date_range(start=grouped["date"].iloc[-1]+pd.offsets.MonthBegin(), periods=12, freq="MS")
+future_df = pd.DataFrame({"date": dates_future, "forecast": future})
+
+fig = px.line(future_df, x="date", y="forecast", markers=True, title=f"{selected_model}-ийн ирэх 12 сарын прогноз")
+st.plotly_chart(fig, use_container_width=True)
+
+# ----------- Газрын зураг дээр анхаарах байршил -----------
+
+st.subheader("Анхаарах газрын байршил (Олон улсын онолын суурьтай кластерчилсан hotspot илрүүлэлт)")
+
+# --- 1. Судалгааны тайлбар, онолын үндэслэл ---
+st.markdown("""
+**Spatial clustering/Hotspot analysis** нь олон улсын судалгаанд осол ихтэй бүс (black spot, hotspot)-ийг тодорхойлох хамгийн баталгаатай арга.  
+- DBSCAN зэрэг алгоритм нь нэг дор ойрхон байрласан зөрчил, ослын бөөгнөрөл (spatial cluster)-ийг автоматаар тодруулдаг.
+- Олон улсын ишлэл: Clark & Evans (1954), Anselin (1995), Hauer (1996).
+
+**Энэхүү газрын зурагт:**
+- Hotspot/кластер бүсийг DBSCAN-ээр илрүүлж, хотын хэмжээнд хамгийн их осолтой цэгүүдийг тодорхойлно.
+- Аймаг бүрийн хамгийн аюултай (осол ихтэй) хар цэгийг мөн хамтад нь харуулна.
+""")
+
+# --- 2. Data preparation (last 12 months accidents only) ---
+recent_df = df[
+    (df["Зөрчил огноо"] >= (df["Зөрчил огноо"].max() - pd.DateOffset(months=12)))
+    & (df[forecast_col] == 1)
+].copy()
+recent_df = recent_df.dropna(subset=["Өргөрөг", "Уртраг"]).copy()  # <--- NaN мөрүүдийг хасах
+
+# --- 2. Data preparation: last 12 months + координат NaN хасна ---
+
+# --- 3. DBSCAN spatial clustering for urban hotspots (100м радиус) ---
+from sklearn.cluster import DBSCAN
+import numpy as np
+
+coords = recent_df[["Өргөрөг", "Уртраг"]].to_numpy()
+kms_per_radian = 6371.0088
+epsilon = 0.1 / kms_per_radian  # 0.1 км == 100м
+if len(coords) >= 3:
+    db = DBSCAN(eps=epsilon, min_samples=3, algorithm='ball_tree', metric='haversine').fit(np.radians(coords))
+    recent_df["cluster"] = db.labels_
+else:
+    recent_df["cluster"] = -1  # insufficient data
+
+# --- 4. Each cluster's central point and frequency ---
+hotspots = (
+    recent_df[recent_df["cluster"] != -1]
+    .groupby("cluster")
+    .agg(
+        n_osol=("Осол", "sum"),
+        lat=("Өргөрөг", "mean"),
+        lon=("Уртраг", "mean"),
+    )
+    .sort_values("n_osol", ascending=False)
+    .reset_index()
+)
+
+# --- 5. Аймаг бүрийн хамгийн их зөрчилтэй хар цэг (өргөн spatial scope) ---
+if "Аймгийн нэр" in df.columns:
+    aimag_top = (
+        recent_df.groupby(["Аймгийн нэр", "Уртраг", "Өргөрөг"])
+        .size().reset_index(name="count")
+        .sort_values(["Аймгийн нэр", "count"], ascending=[True, False])
+        .groupby("Аймгийн нэр").head(1)
+    )
+else:
+    aimag_top = pd.DataFrame()
+
+# --- 6. Газрын зураг үүсгэх ---
+map_center_lat = hotspots["lat"].mean() if not hotspots.empty else 47
+map_center_lon = hotspots["lon"].mean() if not hotspots.empty else 106
+m = folium.Map(location=[map_center_lat, map_center_lon], zoom_start=6)
+
+# --- Хотын кластерласан hotspot-уудыг том радиустайгаар дүрслэх (cluster/DBSCAN) ---
+for _, row in hotspots.iterrows():
+    folium.Circle(
+        location=[row["lat"], row["lon"]],
+        radius=120 + row["n_osol"] * 1,  # олон осолтой бүсийг томруулахаар
+        color="orange",
+        fill=True,
+        fill_opacity=0.55,
+        popup=folium.Popup(
+            f"<b>Хотын hotspot кластер</b><br>Осол: <b>{int(row['n_osol'])}</b>",
+            max_width=350,
+        ),
+    ).add_to(m)
+
+# --- Аймаг бүрийн хар цэгүүдийг бага радиустай, цэнхэр өнгөөр харуулах ---
+if not aimag_top.empty:
+    for _, row in aimag_top.iterrows():
+        count = int(row['count'])
+        folium.Circle(
+            location=[row["Өргөрөг"], row["Уртраг"]],
+            radius=60 + count * 8,
+            color="blue",
+            fill=True,
+            fill_opacity=0.45,
+            popup=f"{row['Аймгийн нэр']} хар цэг<br>Осол: {count}"
+        ).add_to(m)
+
+    # Тайлбар (Legend) нэмэх
+    folium.map.Marker(
+        [map_center_lat + 1.3, map_center_lon],
+        icon=folium.DivIcon(
+            html=f"""<div style="font-size: 14pt; color: orange;">■ Хотын кластерласан hotspot</div>
+                     <div style="font-size: 14pt; color: blue;">■ Аймаг бүрийн хар цэг</div>"""
+        )
+    ).add_to(m)
+
+st_folium(m, width=1920, height=800)
+
+# --- 7. Академик дүгнэлт, зөвлөмж хэсэг ---
+st.markdown("""
+#### Судалгааны дүгнэлт, зөвлөмж
+
+- **Hotspot/кластер бүсүүд** нь хот дотор болон замын уулзвар, гол гудамжны ойролцоо төвлөрдөг нь олон улсын судалгааны үр дүнтэй тохирч байна (Clark & Evans, 1954; Hauer, 1996).
+- **Аймаг бүрийн хар цэг** нь тухайн орон нутгийн захиргаа, замын бодлого төлөвлөлтөд зорилтот арга хэмжээ авах үндэслэл болдог.
+- **Зөвлөмж:** Хотын болон аймаг, дүүргийн дээрх бүсүүдэд нарийвчилсан судалгаа, замын аюулгүй байдлын инженерийн болон менежментийн шийдлийг зорилтот байдлаар хэрэгжүүлэх шаардлагатай. 
+""")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 st.header("1. Замын хөдөлгөөний ослуудын учир шалтгаанын тархалтын шинжилгээ")
 st.write(
-    "Зөрчлийн төрөл, замын нөхцөл, бусад хувьсагчдын хоорондын корреляцийг судлана. Хамгийн ихдээ 15 хувьсагчыг сонгоно"
+    "Зөрчлийн төрөл, замын нөхцөл, усад хувьсагчдын хоорондын корреляцийг судлана. Хамгийн ихдээ 15 хувьсагчыг сонгоно"
+)
+
+st.write("Санамж:")
+
+st.write(
+    "1. Year баганатай хамт one-hot багануудыг (2022, 2023, 2024) хамтад нь оруулахгүй."
+)
+
+st.write(
+    "2. Корреляцад утга учиртай, өөр өөр агуулгатай хувьсагчууд оруул. Жишээ: Year, Авто зам - Замын хучилт Асфальт, анхаарал болгоомжгүй зөрчил, архидан согтуурсан зөрчил гэх мэт."
 )
 
 # ----------- ШИНЭ multiselect хэсэг -----------
@@ -511,7 +844,7 @@ vars_for_corr = [
 max_vars = 15
 default_cols = vars_for_corr[:10]  # default 10-г харуулна
 selected_cols = st.multiselect(
-    f"Корреляцийн матрицад оруулах хувьсагчид (ихдээ {max_vars}):",
+    f"Корреляцийн матрицад оруулах хувьсагчид:",
     vars_for_corr,
     default=default_cols,
     max_selections=max_vars,
@@ -521,10 +854,59 @@ if selected_cols:
 else:
     st.warning("Сонгох хувьсагчидыг оруулна уу!")
 
+st.header("2. Ослын өсөлтийн тренд")
+st.subheader("Жил, сар бүрээр ослын тооны тренд")
+
+# Ослын тоог жил, сарын түвшинд нэгтгэх
+trend_data = (
+    df[df["Осол"] == 1]
+    .groupby(["Year", "Month"])
+    .agg(osol_count=("Осол", "sum"))
+    .reset_index()
+)
+
+# Графикийн шошго бэлдэх (жил-сарын формат, жишээ нь: "2022-01")
+trend_data["YearMonth"] = trend_data.apply(
+    lambda x: f"{int(x['Year'])}-{int(x['Month']):02d}", axis=1
+)
+
+# --- Жил сонгох хэсэг ---
+available_years = sorted(trend_data['Year'].unique())
+year_options = ["Бүгд"] + [str(y) for y in available_years]
+selected_year = st.selectbox("Жил сонгох:", year_options)
+
+# Сонгосон жилээр filter хийх
+if selected_year != "Бүгд":
+    trend_plot = trend_data[trend_data["Year"] == int(selected_year)].copy()
+else:
+    trend_plot = trend_data.copy()
+
+# --- Plotly-гээр зурах ---
+fig = px.line(
+    trend_plot,
+    x="YearMonth",
+    y="osol_count",
+    markers=True,
+    labels={"YearMonth": "Он-Сар", "osol_count": "Ослын тоо"},
+    title=""  # Дээр header байгаа тул энд хоосон
+)
+fig.update_layout(
+    xaxis_tickangle=45,
+    hovermode="x unified",
+    plot_bgcolor="white",
+    yaxis=dict(title="Ослын тоо", rangemode="tozero"),
+    xaxis=dict(title="Он-Сар"),
+)
+fig.update_traces(line=dict(width=3, color="#1f77b4"))
+
+st.write("Доорх графикт ослын тооны өөрчлөлтийг харуулав.")
+st.plotly_chart(fig, use_container_width=True)
+
+
 
 # --- 2. Comparison of Violations Across Districts and Provinces ---
 # 2-р хэсэг: Хар цэг илрүүлэлт, анализ, газрын зураг
-st.header("2. Осол их гардаг хар цэгийн байршлууд")
+st.header("3. Осол их гардаг хар цэгийн байршлууд 2022-2024")
 st.write(
     "Ослын байршлуудыг доорх газрын зургаар харуулав. Дүүрэгт 30 метр радиус, Аймагт 1000 метр радиус"
 )
@@ -536,6 +918,7 @@ if not all(c in df.columns for c in coord_cols):
 
 # Бинар хувьсагчийн жагсаалтыг таны өгсөнчлөн тохируулна
 binary_cols = [
+    "Дугаар",
     "Авто зам - Замын хучилт Тодорхойгүй",
     "Авто зам - Замын хучилт Асфальт",
     "Авто зам - Замын хучилт Бетон",
@@ -758,7 +1141,6 @@ hotspots["avg_days"] = hotspots["dates"].apply(avg_days)
 
 # Шалтгаан хувьсагч (numeric болгож mean тооцоолох)
 cause_info = []
-cause_info = []
 for i, row in hotspots.iterrows():
     filt = (
         (df["Уртраг"] == row["Уртраг"])
@@ -775,6 +1157,23 @@ for i, row in hotspots.iterrows():
     else:
         cause_info.append("")
 hotspots["Шалтгаан"] = cause_info
+
+oslyn_dugaaruud = []
+for i, row in hotspots.iterrows():
+    filt = (
+        (df["Уртраг"] == row["Уртраг"])
+        & (df["Өргөрөг"] == row["Өргөрөг"])
+        & (df["Осол"] == 1)
+    )
+    dugaaruud = df.loc[filt, "Дугаар"].dropna().astype(str).tolist()
+    oslyn_dugaaruud.append(", ".join(dugaaruud) if dugaaruud else "Байхгүй")
+hotspots["Ослыг дугаарууд"] = oslyn_dugaaruud
+
+
+
+
+
+
 
 # Газрын зураг үүсгэх
 if hotspots.empty:
@@ -793,9 +1192,9 @@ else:
             popup=folium.Popup(
                 f"""Осол: {int(row["osol_count"])} <br>
                 Дундаж хоногийн зай: {row["avg_days"]} <br>
-                Шалтгаан: {row["Шалтгаан"]}
+                Шалтгаан: {row["Шалтгаан"]} <br>
+                Ослыг дугаарууд: {row["Ослыг дугаарууд"]}
                 """,
-                
                 max_width=400,
             ),
         ).add_to(m)
@@ -830,11 +1229,8 @@ else:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
-
-
-
-
-categorical_cols = [    "Авто зам - Замын хучилт Тодорхойгүй",
+categorical_cols = [
+    "Авто зам - Замын хучилт Тодорхойгүй",
     "Авто зам - Замын хучилт Асфальт",
     "Авто зам - Замын хучилт Бетон",
     "Авто зам - Замын хучилт Сайжруулсан",
@@ -1024,15 +1420,27 @@ categorical_cols = [    "Авто зам - Замын хучилт Тодорх�
     "Авто зам - Осолд нөлөөлөх хүчин зүйл Мансуурсанаас",
     "Авто зам - Ослын нөхцөл Хоёр тээврийн хэрэгсэл холбогдсон осол",
     "Авто зам - Ослын нөхцөл Нэг тээврийн хэрэгсэл холбогдсон осол",
-    "Авто зам - Ослын нөхцөл Гурав бас түүнээс дээш тээврийн хэрэгсэл холбогдсон осол",]
+    "Авто зам - Ослын нөхцөл Гурав бас түүнээс дээш тээврийн хэрэгсэл холбогдсон осол",
+]
 
-st.header("Категори хувьсагчдын хоорондын хамаарал (Cramér’s V & Chi-square)")
+st.header("4. Категори хувьсагчдын хоорондын хамаарал (Cramér’s V болон Chi-square)")
+
+
+st.write("Тайлбар:")
+st.write(
+    "1-р категори хувьсагч, 2-р категори хувьсагч - Сонгох UI дээр categorical хувьсагчдаас 2-ыг сонгоно."
+)
+st.write("Chi-square: p-value бага бол (ихэвчлэн <0.05) хамааралтай гэж үзнэ.")
+st.write(
+    "Cramér’s V: 0-д ойрхон бол бараг хамааралгүй, 1-д ойр бол хүчтэй хамааралтай."
+)
+st.write("Crosstab (frequency table) – тухайн хувьсагчдын давтамжийг харуулна.")
+
 
 var1 = st.selectbox("1-р категори хувьсагч:", categorical_cols)
-var2 = st.selectbox("2-р категори хувьсагч:", [c for c in categorical_cols if c != var1])
-
-
-
+var2 = st.selectbox(
+    "2-р категори хувьсагч:", [c for c in categorical_cols if c != var1]
+)
 
 
 from scipy.stats import chi2_contingency
@@ -1059,14 +1467,14 @@ if var1 and var2:
     st.subheader("2. Cramér’s V")
     st.write(f"**Cramér’s V:** {cramers_v:.3f} (0=хамааралгүй, 1=хүчтэй хамаарал)")
     if cramers_v < 0.1:
-        st.info("Хамааралгүй бараг")
+        st.info("Бараг хамааралгүй. (Сул хамаарлаас доогуур)")
     elif cramers_v < 0.3:
         st.info("Сул хамааралтай")
     elif cramers_v < 0.5:
         st.info("Дунд зэрэг хамааралтай")
     else:
         st.success("Их хамааралтай")
-    
+
     # Crosstab харуулах
     st.write("**Crosstab:**")
     st.dataframe(table)
