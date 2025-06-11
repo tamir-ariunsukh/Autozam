@@ -1,32 +1,43 @@
+# ==================== LIBRARY IMPORTS ====================
 import streamlit as st
 import pandas as pd
 import plotly.express as px
 import seaborn as sns
 import matplotlib.pyplot as plt
 import numpy as np
-from datetime import datetime
-import folium
-from streamlit_folium import st_folium
-import io
-import pandas as pd
-import numpy as np
-from sklearn.linear_model import LinearRegression, Ridge, Lasso
-from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor, AdaBoostRegressor, ExtraTreesRegressor
+import plotly.express as px
+
+from sklearn.linear_model import LinearRegression, Ridge, Lasso, ElasticNet
+from sklearn.ensemble import (
+    RandomForestRegressor,
+    GradientBoostingRegressor,
+    AdaBoostRegressor,
+    ExtraTreesRegressor,
+    StackingRegressor,
+    HistGradientBoostingRegressor,
+    VotingRegressor,
+)
 from sklearn.tree import DecisionTreeRegressor
 from sklearn.neighbors import KNeighborsRegressor
 from sklearn.svm import SVR
 from sklearn.neural_network import MLPRegressor
 from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
 from xgboost import XGBRegressor
 from lightgbm import LGBMRegressor
 from catboost import CatBoostRegressor
+
 import tensorflow as tf
+import folium
+from streamlit_folium import st_folium
+from datetime import datetime
+import io
 
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-import plotly.express as px
 
-
-st.set_page_config(page_title="С.Цолмон, А.Тамир нарын судалгаа 2025-06-11", layout="wide")
+st.set_page_config(
+    page_title="С.Цолмон, А.Тамир нарын судалгаа 2025-06-11", layout="wide"
+)
 
 
 @st.cache_data
@@ -341,29 +352,141 @@ st.title("Зам тээврийн ослуудын шинжилгээ (2022-2024
 
 st.header("5. Ирээдүйн ослын таамаглал (Олон ML/DL загвар)")
 st.write("13 төрлийн ML/DL/ANN/NN моделийн таамаглалыг нэг дор үзүүлнэ.")
+estimators = [
+    ("rf", RandomForestRegressor(n_estimators=50)),
+    ("ridge", Ridge()),
+    ("dt", DecisionTreeRegressor()),
+]
 
+# -- Voting (external model-ууд оруулах боломжтой fallback)
+voting_estimators = [
+    ("rf", RandomForestRegressor()),
+    ("ridge", Ridge()),
+    ("xgb", XGBRegressor(verbosity=0)),
+    ("cat", CatBoostRegressor(verbose=0)),
+]
 
 MODEL_LIST = [
     ("LinearRegression", LinearRegression()),
     ("Ridge", Ridge()),
     ("Lasso", Lasso()),
-    ("DecisionTree", DecisionTreeRegressor()),
-    ("RandomForest", RandomForestRegressor()),
-    ("ExtraTrees", ExtraTreesRegressor()),
-    ("GradientBoosting", GradientBoostingRegressor()),
-    ("AdaBoost", AdaBoostRegressor()),
+    ("DecisionTree", DecisionTreeRegressor(random_state=42)),
+    ("RandomForest", RandomForestRegressor(random_state=42)),
+    ("ExtraTrees", ExtraTreesRegressor(random_state=42)),
+    ("GradientBoosting", GradientBoostingRegressor(random_state=42)),
+    ("HistGB", HistGradientBoostingRegressor(random_state=42)),
+    ("AdaBoost", AdaBoostRegressor(random_state=42)),
     ("KNeighbors", KNeighborsRegressor()),
-    ("SVR", SVR()),
-    ("MLPRegressor", MLPRegressor(hidden_layer_sizes=(64, 32), max_iter=1000)),
-    ("XGBRegressor", XGBRegressor(verbosity=0)),
-    ("CatBoostRegressor", CatBoostRegressor(verbose=0)),
+    ("SVR", SVR()),  # random_state байхгүй
+    (
+        "MLPRegressor",
+        MLPRegressor(hidden_layer_sizes=(64, 32), max_iter=1000, random_state=42),
+    ),
+    ("ElasticNet", ElasticNet()),
+    ("XGBRegressor", XGBRegressor(verbosity=0, random_state=42)),
+    ("CatBoostRegressor", CatBoostRegressor(verbose=0, random_state=42)),
+    ("LGBMRegressor", LGBMRegressor(random_state=42)),
+    (
+        "Stacking",
+        StackingRegressor(
+            estimators=estimators,
+            final_estimator=LinearRegression(),
+            passthrough=False,
+            cv=5,
+            n_jobs=-1,
+        ),
+    ),
+    # -- Voting (external боломжтой)
 ]
 
-# ----------- Өгөгдөл бэлтгэх -----------
+# --- Үндсэн хувьсагчид
 forecast_col = "Осол"
-grouped = df[df[forecast_col]==1].groupby(["Year", "Month"]).agg(osol_count=(forecast_col, "sum")).reset_index()
-grouped["date"] = pd.to_datetime(grouped[["Year", "Month"]].assign(DAY=1))
 weather_cols = [
+    "ГБХ: бусад зөрчил",
+    "анхаарал болгоомжгүй зөрчил",
+    "архидан согтуурсан зөрчил",
+    "асран хамгаалагч зөрчил",
+    "бусад зөрчил",
+    "бэлдмэл хэрэглэсэн этгээдэд т/х-ийн жолоог шилжүүлсэн зөрчил",
+    "бүрэн бус тээврийн хэрэгсэл жолоодсон зөрчил",
+    "бүх шатны боловсролын/б-ын холбогдох албан тушаалтан 10 хүртэлх насны хүүхдийг харгалзах хүнгүйгээр ЗХ-д оролцуулсан зөрчил",
+    "гадны гэрэл хэрэглэх зөрчил",
+    "гарамгүй хэсгээр зам хөндлөн гарсан зөрчил",
+    "гарц зөрчил",
+    "гэрэл дохио зөрчсөн зөрчил",
+    "гүйцэд түрүүлэх үйлдэл буруу зөрчил",
+    "гүйцэж түрүүлэх үйлдэл буруу хийсэн зөрчил",
+    "жолоодох чадваргүй үедээ зорчих хэсгээр явсан зөрчил",
+    "жолоодох эрхээ хасуулсан этгээд эрхийн үнэмлэхгүй жолоодсон зөрчил",
+    "зам: ЗХ-ний дүрмийг сахин биелүүлээгүй зөрчил",
+    "зам: ЗХАБ-ыг хангаж чадахааргүй өвчтэй буюу ядарсан үедээ т/х жолоодож замын хөдөлгөөнд оролцсон зөрчил",
+    "зам: ЗХАБ-ын эсрэг гэмт хэрэг зөрчил",
+    "зам: Т/х жолоодох эрхгүй (жолоодлогын дадлага хийхээс бусад тохиолдолд) буюу эрхээ хасуулсан этгээдэд т/х-ийн жолоог шилжүүлсэн зөрчил",
+    "зам: Эцэг эх зөрчил",
+    "зам: гарц зөрчил",
+    "зам: замын гэрэлтүүлэг хангалтгүй зөрчил",
+    "зам: замын тэмдэг тэмдэглэл байхгүй байсан зөрчил",
+    "зам: зогсолт зогсоолын журам зөрчсөн зөрчил",
+    "зам: ойртон ирж яваа тээврийн хэрэгслийн урдуур гэнэт гүйсэн зөрчил",
+    "зам: тэмдэг тэмдэглэл зөрчсөн зөрчил",
+    "зам: явган хүний гарц ба гарамтай хэсгийн гарцгүй зөрчил",
+    "замын гэрэлтүүлэг хангалтгүй зөрчил",
+    "замын нөхцөлөөс зөрчил",
+    "замын тэмдэг тэмдэглэл байхгүй байсан зөрчил",
+    "зан харьцаа зөрчил",
+    "зогсолт зогсоолын журам зөрчсөн зөрчил",
+    "зогсоох арга хэмжээ аваагүй зөрчил",
+    "зөрчлийн талаар холбогдох байгууллагад шуурхай мэдээлээгүй зөрчил",
+    "мал хариулгагүй зөрчил",
+    "нийтээр дагаж мөрдөх хэм хэмжээ зөрчсөн зөрчил",
+    "ойртон ирж яваа тээврийн хэрэгслийн урдуур гэнэт гүйсэн зөрчил",
+    "согтуугаар тээврийн хэрэгсэл жолоодсон зөрчил",
+    "техникийн гэмтлээс замын нөхцөл байдлаас зөрчил",
+    "уулзвар гарц нэвтрэх журам зөрчсөн зөрчил",
+    "ухрах үйлдэл буруу хийсэн зөрчил",
+    "хажуу хоорондын зай тохируулаагүй зөрчил",
+    "хамгаалах бүс хэрэглээгүй зөрчил",
+    "хувь хүний ёс суртахууны төлөвшил зөрчил",
+    "хурд тохируулаагүй зөрчил",
+    "хурд хэтрүүлсэн зөрчил",
+    "хяналт шалгалт сул зөрчил",
+    "хүн ба ачаа тээвэрлэх журам зөрчсөн зөрчил",
+    "эвдэж сүйтгэсэн зөрчил",
+    "эгнээ байр буруу эзэлсэн зөрчил",
+    "эргэх үйлдэл буруу хийсэн зөрчил",
+    "эрхийн үнэмлэхгүй этгээд тээврийн хэрэгсэл жолоодсон зөрчил",
+    "эсрэг урсгалд орох зөрчил",
+    "эсрэг урсгалд орсон зөрчил",
+    "явган хүний гарц ба гарамтай хэсгийн гарцгүй хэсгээр гарсан зөрчил",
+    "үүргээ зохих ёсоор биелүүлээгүй зөрчил",
+    "өөрийгөө хянаж зөрчил",
+    "Дүүрэг",
+    "Аймаг",
+    "Авто зам - Замын харьяалал Нийслэлийн чанартай авто зам",
+    "Авто зам - Замын харьяалал Орон нутгийн чанартай авто зам",
+    "Авто зам - Замын харьяалал Иргэн аж ахуйн нэгж, байгууллагын дотоодын зам",
+    "Авто зам - Замын харьяалал Улсын чанартай авто зам",
+    "Авто зам - Замын харьяалал Хувийн зам",
+    "Авто зам - Замын харьяалал Олон улсын чанартай авто зам",
+    "Авто зам - Замын харьяалал Тусгай зориулалтын зам",
+    "Авто зам - Замын ангилал Хорооллын",
+    "Авто зам - Замын ангилал Ердийн",
+    "Авто зам - Замын ангилал Тууш",
+    "Авто зам - Замын ангилал Хурдны",
+    "Авто зам - Замын гадаргуу Хуурай",
+    "Авто зам - Замын гадаргуу Мөстэй",
+    "Авто зам - Замын гадаргуу Нойтон",
+    "Авто зам - Замын гадаргуу Цастай",
+    "Авто зам - Замын гадаргуу Эдрэлтэй",
+    "Авто зам - Замын гадаргуу Бохирдсон",
+    "Авто зам - Замын онцлог Тэгш",
+    "Авто зам - Замын онцлог Уруу",
+    "Авто зам - Замын онцлог Өгсүүр",
+    "Авто зам - Замын онцлог Шулуун",
+    "Авто зам - Замын онцлог Хазгай",
+    "Авто зам - Замын онцлог Огцом эргэлттэй",
+    "Авто зам - Замын онцлог Налуу",
+    "Авто зам - Замын онцлог Алсуур эргэлттэй",
     "Авто зам - Үзэгдэх орчин Чөлөөтэй",
     "Авто зам - Үзэгдэх орчин Зорчих хэсэг гэрэлтүүлэггүй",
     "Авто зам - Үзэгдэх орчин Зорчих хэсэг гэрэгтүүлэгтэй",
@@ -378,20 +501,52 @@ weather_cols = [
     "Авто зам - Цаг агаар Шуургатай",
     "Авто зам - Цаг агаар Манантай",
     "Авто зам - Цаг агаар Бороотой",
-        "Авто зам - Замын онцлог Тэгш",
-    "Авто зам - Замын онцлог Уруу",
-    "Авто зам - Замын онцлог Өгсүүр",
-    "Авто зам - Замын онцлог Шулуун",
-    "Авто зам - Замын онцлог Хазгай",
-    "Авто зам - Замын онцлог Огцом эргэлттэй",
-    "Авто зам - Замын онцлог Налуу",
-    "Авто зам - Замын онцлог Алсуур эргэлттэй",
-        "Авто зам - Замын гадаргуу Хуурай",
-    "Авто зам - Замын гадаргуу Мөстэй",
-    "Авто зам - Замын гадаргуу Нойтон",
-    "Авто зам - Замын гадаргуу Цастай",
-    "Авто зам - Замын гадаргуу Эдрэлтэй",
-    "Авто зам - Замын гадаргуу Бохирдсон",
+    "Авто зам - Бусад Өдөр",
+    "Авто зам - Бусад Суурин газар",
+    "Авто зам - Бусад Шөнө",
+    "Авто зам - Бусад Суурингийн гаднах",
+    "Авто зам - Бусад Аж ахуйн нэгж - Бусад",
+    "Авто зам - Бусад Гудамж талбай - бусад",
+    "Авто зам - Бусад Бусад газар - Өвөлжөө",
+    "Авто зам - Бусад Бусад газар - Хөдөө хээр",
+    "Авто зам - Бусад Бусад газар - Бусад",
+    "Авто зам - Бусад Гудамж талбай - ил зогсоол",
+    "Авто зам - Бусад Гудамж талбай - төмөр зам",
+    "Авто зам - Бусад Гудамж талбай - гэр хорооллын гудамж",
+    "Авто зам - Бусад Олон нийтийн газар - бөөний худалдааны төв",
+    "Авто зам - Бусад Олон нийтийн газар - бусад",
+    "Авто зам - Бусад Гудамж талбай - автобусны буудал",
+    "Авто зам - Бусад Гудамж талбай - орон сууцны хорооллын гудамж",
+    "Авто зам - Бусад эмнэлэг хувийн өмчийн",
+    "Авто зам - Бусад Бусад газар - Бэлчээр",
+    "Авто зам - Бусад Олон нийтийн газар - авто вокзал",
+    "Авто зам - Бусад Бусад газар - Хаваржаа",
+    "Авто зам - Бусад Олон нийтийн газар - дэлгүүр",
+    "Авто зам - Бусад шатахуун түгээх станц",
+    "Авто зам - Бусад Гэр, орон сууц - хувийн байшин",
+    "Авто зам - Бусад Бусад газар - Зуслан",
+    "Авто зам - Бусад Бусад газар - Ойн сан бүхий газар",
+    "Авто зам - Бусад Бусад газар - Хилийн бүс",
+    "Авто зам - Бусад Бусад газар - Гол, усны ай сав газар",
+    "Авто зам - Бусад Олон нийтийн газар - амралтын газар",
+    "Авто зам - Бусад Гэр, орон сууц - гэр",
+    "Авто зам - Бусад Бусад газар - Намаржаа",
+    "Авто зам - Бусад засвар, үйлчилгээний газар",
+    "Авто зам - Бусад Гэр, орон сууц - бусад",
+    "Авто зам - Бусад Нийтийн тээвэр - галт тэрэг",
+    "Авто зам - Бусад Бусад газар - Ашиглаж байгаа уурхай",
+    "Авто зам - Бусад Гэр, орон сууц - орон сууцны байр",
+    "Авто зам - Бусад Гэр, орон сууц - гарааш",
+    "Авто зам - Бусад Бусад газар - Баригдаж байгаа барилга",
+    "Авто зам - Бусад Олон нийтийн газар - нисэх онгоцны буудал",
+    "Авто зам - Бусад Бусад газар - Гадаад улсад",
+    "Авто зам - Бусад Бусад газар - Ашигт малтмалын орд газар",
+    "Авто зам - Бусад Нийтийн тээвэр - том оврын автобус",
+    "Авто зам - Бусад Олон нийтийн газар - төмөр замын вокзал",
+    "Авто зам - Бусад эмнэлэг төрийн өмчийн",
+    "Авто зам - Бусад Төрийн бус байгууллага - бусад",
+    "Авто зам - Бусад Нийтийн тээвэр - нисэх онгоц",
+    "Авто зам - Бусад АТМ",
     "Авто зам - Замын хэсэг Уулзвар",
     "Авто зам - Замын хэсэг Бусад",
     "Авто зам - Замын хэсэг Гүүр",
@@ -408,7 +563,12 @@ weather_cols = [
     "Авто зам - Замын хэсэг Зорчих хэсгийн хөвөө",
     "Авто зам - Замын хэсэг Туслах зам",
     "Авто зам - Замын хэсэг Зам, барилгын ажлын талбай",
-     "Авто зам - Осолд нөлөөлөх хүчин зүйл Зам дээр саад байсан",
+    "Авто зам - Ослын ноцтой байдал Хөнгөн гэмтэл авсан осол",
+    "Авто зам - Ослын ноцтой байдал Хүнд, хүндэвтэр гэмтэл авсан осол",
+    "Авто зам - Ослын ноцтой байдал Хүн нас барсан осол",
+    "Авто зам - Ослын ноцтой байдал Эд материалын хохиролтой осол",
+    "Авто зам - Ослын ноцтой байдал Гэмтэл бэртэл аваагүй осол",
+    "Авто зам - Осолд нөлөөлөх хүчин зүйл Зам дээр саад байсан",
     "Авто зам - Осолд нөлөөлөх хүчин зүйл Гэрэл шилжүүлээгүй",
     "Авто зам - Осолд нөлөөлөх хүчин зүйл Хэт ядарсанаас",
     "Авто зам - Осолд нөлөөлөх хүчин зүйл Согтуугаар тээврийн хэрэгсэл жолоодсоноос",
@@ -427,53 +587,60 @@ weather_cols = [
     "Авто зам - Ослын нөхцөл Гурав бас түүнээс дээш тээврийн хэрэгсэл холбогдсон осол",
 ]
 
-# Сар бүр агрегатлах (sum хийх)
-monthly_weather = df.groupby(['Year', 'Month'])[weather_cols].sum().reset_index()
+X = df[weather_cols].values
+y = df["Осол"].values
 
-# Үндсэн grouped датафреймтэй merge хийх (Year, Month-оор)
-grouped = pd.merge(grouped, monthly_weather, on=['Year', 'Month'], how='left')
+# RandomForest сургалт
+rf = RandomForestRegressor(n_estimators=100)
+rf.fit(X, y)
 
-# Lag-уудыг үүсгэнэ
+# Feature importance
+importances = rf.feature_importances_
+indices = np.argsort(importances)[::-1]
+top_k = 14  # Top 10 шинж
+
+top_features = [weather_cols[i] for i in indices[:top_k]]
+print("Top feature-үүд:", top_features)
+
+
+# --- Сар бүрийн агрегат (sum) хийх
+monthly_weather = df.groupby(["Year", "Month"])[top_features].sum().reset_index()
+
+# --- Үндсэн дата (ослын тоо) гаргах
+grouped = (
+    df[df[forecast_col] == 1]
+    .groupby(["Year", "Month"])
+    .agg(osol_count=(forecast_col, "sum"))
+    .reset_index()
+)
+grouped["date"] = pd.to_datetime(grouped[["Year", "Month"]].assign(DAY=1))
+grouped = pd.merge(grouped, monthly_weather, on=["Year", "Month"], how="left")
+grouped = grouped.sort_values("date").reset_index(drop=True)
+
+# --- Lag үүсгэх
 n_lag = 12
-for i in range(1, n_lag+1):
+for i in range(1, n_lag + 1):
     grouped[f"osol_lag_{i}"] = grouped["osol_count"].shift(i)
 grouped = grouped.dropna().reset_index(drop=True)
 
-# X, y matrix-д lag болон цаг агаарын хувьсагчдыг хамтад нь оруулна
-X = grouped[[f"osol_lag_{i}" for i in range(1, n_lag+1)] + weather_cols].values
+# --- X, y matrix
+feature_cols = [f"osol_lag_{i}" for i in range(1, n_lag + 1)] + top_features
+X = grouped[feature_cols].values
 y = grouped["osol_count"].values.reshape(-1, 1)
 
-# ---------- СКЭЙЛИНГ (ЗААВАЛ) ----------
+# --- Scale хийх
 scaler_X = MinMaxScaler()
 scaler_y = MinMaxScaler()
 X_scaled = scaler_X.fit_transform(X)
 y_scaled = scaler_y.fit_transform(y)
 
-# ---------- TRAIN/TEST ----------
+# --- Train/test split (цагийн цуваа учраас shuffle хийхгүй)
 train_size = int(len(X_scaled) * 0.8)
 X_train, y_train = X_scaled[:train_size], y_scaled[:train_size].flatten()
 X_test, y_test = X_scaled[train_size:], y_scaled[train_size:].flatten()
 
-# --- Модел жагсаалт ---
-MODEL_LIST = [
-    ("LinearRegression", LinearRegression()),
-    ("Ridge", Ridge()),
-    ("Lasso", Lasso()),
-    ("DecisionTree", DecisionTreeRegressor()),
-    ("RandomForest", RandomForestRegressor()),
-    ("ExtraTrees", ExtraTreesRegressor()),
-    ("GradientBoosting", GradientBoostingRegressor()),
-    ("AdaBoost", AdaBoostRegressor()),
-    ("KNeighbors", KNeighborsRegressor()),
-    ("SVR", SVR()),
-    ("MLPRegressor", MLPRegressor(hidden_layer_sizes=(64, 32), max_iter=1000)),
-    ("XGBRegressor", XGBRegressor(verbosity=0)),
-    ("CatBoostRegressor", CatBoostRegressor(verbose=0)),
-]
-
+# --- ML моделүүдийг сургах
 progress_bar = st.progress(0, text="ML моделийг сургаж байна...")
-
-# ------- Олон моделийг сургах/таамаглах -------
 results = []
 y_preds = {}
 for i, (name, model) in enumerate(MODEL_LIST):
@@ -485,15 +652,14 @@ for i, (name, model) in enumerate(MODEL_LIST):
     rmse = np.sqrt(mse)
     r2 = r2_score(y_test, y_pred)
     results.append({"Model": name, "MAE": mae, "RMSE": rmse, "R2": r2})
-    progress = min(int((i+1) / len(MODEL_LIST) * 100), 100)
+    progress = min(int((i + 1) / len(MODEL_LIST) * 100), 100)
     progress_bar.progress(progress, text=f"{name} дууслаа")
 progress_bar.empty()
 st.success("Бүх ML модел сургагдлаа!")
 
-# ----------- Метрик харуулах, Excel рүү татах -----------
+# --- Метрик/Excel харуулах
 results_df = pd.DataFrame(results)
 st.dataframe(results_df)
-
 excel_buffer = pd.ExcelWriter("model_metrics.xlsx", engine="xlsxwriter")
 results_df.to_excel(excel_buffer, index=False)
 excel_buffer.close()
@@ -502,11 +668,12 @@ with open("model_metrics.xlsx", "rb") as f:
         label="Моделийн метрик Excel татах",
         data=f,
         file_name="model_metrics.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
-# ----------- Ирээдүйн 30, 90, 180, 365 хоногийн прогноз -----------
+# --- Ирээдүйн 30, 90, 180, 365 хоногийн прогноз
 forecast_steps = {"30 хоног": 1, "90 хоног": 3, "180 хоног": 6, "365 хоног": 12}
+
 
 def forecast_next(model, last_values, steps=12):
     preds = []
@@ -518,47 +685,45 @@ def forecast_next(model, last_values, steps=12):
         input_seq[-1] = pred
     return np.array(preds)
 
-model_forecasts = {}
-last_seq = X_scaled[-1]  # хамгийн сүүлийн 12 сар (scaled)
 
+model_forecasts = {}
+last_seq = X_scaled[-1]
 for name, model in MODEL_LIST:
     preds_dict = {}
     for k, s in forecast_steps.items():
         scaled_preds = forecast_next(model, last_seq, steps=s)
-        # Inverse scale to real values
-        # Бүх таамаглалыг scaler_y-р бодит утга руу хөрвүүлнэ
         inv_preds = scaler_y.inverse_transform(scaled_preds.reshape(-1, 1)).flatten()
         preds_dict[k] = inv_preds
     model_forecasts[name] = preds_dict
 
-# --- 1. Test set дээрх бодит болон таамагласан ослын тоо (модел бүрээр) ---
-test_dates = grouped["date"].iloc[-len(X_test):].values
-test_true = scaler_y.inverse_transform(y_test.reshape(-1, 1)).flatten()  # inverse scale
-
-test_preds_df = pd.DataFrame({'date': test_dates, 'real': test_true})
+# --- Test set дээрх бодит/таамагласан утга
+test_dates = grouped["date"].iloc[-len(X_test) :].values
+test_true = scaler_y.inverse_transform(y_test.reshape(-1, 1)).flatten()
+test_preds_df = pd.DataFrame({"date": test_dates, "real": test_true})
 for name in MODEL_LIST:
     y_pred_inv = scaler_y.inverse_transform(y_preds[name[0]].reshape(-1, 1)).flatten()
     test_preds_df[name[0]] = y_pred_inv
 
-# --- 2. Ирээдүйн forecast (12 сар) модель бүрээр ---
-future_dates = pd.date_range(start=grouped["date"].iloc[-1]+pd.offsets.MonthBegin(), periods=12, freq="MS")
-future_preds_df = pd.DataFrame({'date': future_dates})
+# --- Ирээдүйн forecast (12 сар) модель бүрээр
+future_dates = pd.date_range(
+    start=grouped["date"].iloc[-1] + pd.offsets.MonthBegin(), periods=12, freq="MS"
+)
+future_preds_df = pd.DataFrame({"date": future_dates})
 for name, model in MODEL_LIST:
     scaled_preds = forecast_next(model, last_seq, steps=12)
     inv_preds = scaler_y.inverse_transform(scaled_preds.reshape(-1, 1)).flatten()
     future_preds_df[name] = inv_preds
 
-# --- 3. Excel файлд export хийх (хоёр sheet-тэй: test болон ирээдүй) ---
+# --- Excel файлд export хийх (Test/Forecast sheet)
 with pd.ExcelWriter("model_predictions.xlsx", engine="xlsxwriter") as writer:
     test_preds_df.to_excel(writer, index=False, sheet_name="Test_Predictions")
     future_preds_df.to_excel(writer, index=False, sheet_name="Future_Predictions")
-
 with open("model_predictions.xlsx", "rb") as f:
     st.download_button(
         label="Test/Forecast бүх моделийн таамаглалуудыг Excel-р татах",
         data=f,
         file_name="model_predictions.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
 st.subheader("Test датан дээрх модел бүрийн бодит болон таамагласан утгууд:")
@@ -566,22 +731,30 @@ st.dataframe(test_preds_df.head(10))
 st.subheader("Ирээдүйн 12 сарын прогноз (модел бүрээр):")
 st.dataframe(future_preds_df)
 
-# ----------- 1 жилийн прогноз график (модел сонгох) -----------
+# --- 1 жилийн прогноз график (модел сонгох)
 st.subheader("1 жилийн прогноз график (модел бүрээр):")
 selected_model = st.selectbox("Модель сонгох:", list(model_forecasts.keys()))
 future = model_forecasts[selected_model]["365 хоног"]
-dates_future = pd.date_range(start=grouped["date"].iloc[-1]+pd.offsets.MonthBegin(), periods=12, freq="MS")
+dates_future = pd.date_range(
+    start=grouped["date"].iloc[-1] + pd.offsets.MonthBegin(), periods=12, freq="MS"
+)
 future_df = pd.DataFrame({"date": dates_future, "forecast": future})
 
-import plotly.express as px
-fig = px.line(future_df, x="date", y="forecast", markers=True, title=f"{selected_model}-ийн ирэх 12 сарын прогноз")
+fig = px.line(
+    future_df,
+    x="date",
+    y="forecast",
+    markers=True,
+    title=f"{selected_model}-ийн ирэх 12 сарын прогноз",
+)
 st.plotly_chart(fig, use_container_width=True)
-
 
 
 # ----------- Газрын зураг дээр анхаарах байршил -----------
 
-st.subheader("Анхаарах газрын байршил (Олон улсын онолын суурьтай кластерчилсан hotspot илрүүлэлт)")
+st.subheader(
+    "Анхаарах газрын байршил (Олон улсын онолын суурьтай кластерчилсан hotspot илрүүлэлт)"
+)
 
 # --- 1. Судалгааны тайлбар, онолын үндэслэл ---
 st.markdown("""
@@ -599,7 +772,9 @@ recent_df = df[
     (df["Зөрчил огноо"] >= (df["Зөрчил огноо"].max() - pd.DateOffset(months=12)))
     & (df[forecast_col] == 1)
 ].copy()
-recent_df = recent_df.dropna(subset=["Өргөрөг", "Уртраг"]).copy()  # <--- NaN мөрүүдийг хасах
+recent_df = recent_df.dropna(
+    subset=["Өргөрөг", "Уртраг"]
+).copy()  # <--- NaN мөрүүдийг хасах
 
 # --- 2. Data preparation: last 12 months + координат NaN хасна ---
 
@@ -611,7 +786,9 @@ coords = recent_df[["Өргөрөг", "Уртраг"]].to_numpy()
 kms_per_radian = 6371.0088
 epsilon = 0.1 / kms_per_radian  # 0.1 км == 100м
 if len(coords) >= 3:
-    db = DBSCAN(eps=epsilon, min_samples=3, algorithm='ball_tree', metric='haversine').fit(np.radians(coords))
+    db = DBSCAN(
+        eps=epsilon, min_samples=3, algorithm="ball_tree", metric="haversine"
+    ).fit(np.radians(coords))
     recent_df["cluster"] = db.labels_
 else:
     recent_df["cluster"] = -1  # insufficient data
@@ -633,9 +810,11 @@ hotspots = (
 if "Аймгийн нэр" in df.columns:
     aimag_top = (
         recent_df.groupby(["Аймгийн нэр", "Уртраг", "Өргөрөг"])
-        .size().reset_index(name="count")
+        .size()
+        .reset_index(name="count")
         .sort_values(["Аймгийн нэр", "count"], ascending=[True, False])
-        .groupby("Аймгийн нэр").head(1)
+        .groupby("Аймгийн нэр")
+        .head(1)
     )
 else:
     aimag_top = pd.DataFrame()
@@ -662,14 +841,14 @@ for _, row in hotspots.iterrows():
 # --- Аймаг бүрийн хар цэгүүдийг бага радиустай, цэнхэр өнгөөр харуулах ---
 if not aimag_top.empty:
     for _, row in aimag_top.iterrows():
-        count = int(row['count'])
+        count = int(row["count"])
         folium.Circle(
             location=[row["Өргөрөг"], row["Уртраг"]],
             radius=60 + count * 8,
             color="blue",
             fill=True,
             fill_opacity=0.45,
-            popup=f"{row['Аймгийн нэр']} хар цэг<br>Осол: {count}"
+            popup=f"{row['Аймгийн нэр']} хар цэг<br>Осол: {count}",
         ).add_to(m)
 
     # Тайлбар (Legend) нэмэх
@@ -678,7 +857,7 @@ if not aimag_top.empty:
         icon=folium.DivIcon(
             html=f"""<div style="font-size: 14pt; color: orange;">■ Хотын кластерласан hotspot</div>
                      <div style="font-size: 14pt; color: blue;">■ Аймаг бүрийн хар цэг</div>"""
-        )
+        ),
     ).add_to(m)
 
 st_folium(m, width=1920, height=800)
@@ -691,23 +870,6 @@ st.markdown("""
 - **Аймаг бүрийн хар цэг** нь тухайн орон нутгийн захиргаа, замын бодлого төлөвлөлтөд зорилтот арга хэмжээ авах үндэслэл болдог.
 - **Зөвлөмж:** Хотын болон аймаг, дүүргийн дээрх бүсүүдэд нарийвчилсан судалгаа, замын аюулгүй байдлын инженерийн болон менежментийн шийдлийг зорилтот байдлаар хэрэгжүүлэх шаардлагатай. 
 """)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 st.header("1. Замын хөдөлгөөний ослуудын учир шалтгаанын тархалтын шинжилгээ")
@@ -955,7 +1117,7 @@ trend_data["YearMonth"] = trend_data.apply(
 )
 
 # --- Жил сонгох хэсэг ---
-available_years = sorted(trend_data['Year'].unique())
+available_years = sorted(trend_data["Year"].unique())
 year_options = ["Бүгд"] + [str(y) for y in available_years]
 selected_year = st.selectbox("Жил сонгох:", year_options)
 
@@ -972,7 +1134,7 @@ fig = px.line(
     y="osol_count",
     markers=True,
     labels={"YearMonth": "Он-Сар", "osol_count": "Ослын тоо"},
-    title=""  # Дээр header байгаа тул энд хоосон
+    title="",  # Дээр header байгаа тул энд хоосон
 )
 fig.update_layout(
     xaxis_tickangle=45,
@@ -985,7 +1147,6 @@ fig.update_traces(line=dict(width=3, color="#1f77b4"))
 
 st.write("Доорх графикт ослын тооны өөрчлөлтийг харуулав.")
 st.plotly_chart(fig, use_container_width=True)
-
 
 
 # --- 2. Comparison of Violations Across Districts and Provinces ---
@@ -1252,11 +1413,6 @@ for i, row in hotspots.iterrows():
     dugaaruud = df.loc[filt, "Дугаар"].dropna().astype(str).tolist()
     oslyn_dugaaruud.append(", ".join(dugaaruud) if dugaaruud else "Байхгүй")
 hotspots["Ослыг дугаарууд"] = oslyn_dugaaruud
-
-
-
-
-
 
 
 # Газрын зураг үүсгэх
@@ -1541,7 +1697,9 @@ if var1 and var2:
     cramers_v = np.sqrt(chi2 / (n * (min(k, r) - 1))) if min(k, r) > 1 else np.nan
 
     st.subheader("1. Chi-square тест")
-    st.write("Категори (чанарын) өгөгдөл хоорондоо хамааралтай эсэхийг шалгадаг статистикийн тест.Жишээ: Хүйс (эрэгтэй/эмэгтэй) болон Тамхи татдаг эсэх (тийм/үгүй) хоёр хувьсагч хооронд хамаарал байна уу гэдгийг мэдэх. p-value < 0.05 бол хамааралтай гэж үздэг (өөрөөр хэлбэл, санамсаргүй тохиолдол биш)")
+    st.write(
+        "Категори (чанарын) өгөгдөл хоорондоо хамааралтай эсэхийг шалгадаг статистикийн тест.Жишээ: Хүйс (эрэгтэй/эмэгтэй) болон Тамхи татдаг эсэх (тийм/үгүй) хоёр хувьсагч хооронд хамаарал байна уу гэдгийг мэдэх. p-value < 0.05 бол хамааралтай гэж үздэг (өөрөөр хэлбэл, санамсаргүй тохиолдол биш)"
+    )
 
     st.write(f"**Chi-square statistic:** {chi2:.3f}")
     st.write(f"**p-value:** {p:.4f}")
@@ -1552,7 +1710,9 @@ if var1 and var2:
 
     st.subheader("2. Cramér’s V")
 
-    st.write("Chi-square тестийн гарсан үр дүнг 0-ээс 1 хүртэл хэмжигдэх “хүчтэй эсэх” буюу хамаарлын хүчийг хэмждэг коэффициент.Chi-square тестээр хамаарал байна гэж гарсан бол яг хичнээн хүчтэй хамаарал вэ? гэдгийг хардаг. 0 бол хамаарал байхгүй, 1 бол маш хүчтэй хамаарал.")
+    st.write(
+        "Chi-square тестийн гарсан үр дүнг 0-ээс 1 хүртэл хэмжигдэх “хүчтэй эсэх” буюу хамаарлын хүчийг хэмждэг коэффициент.Chi-square тестээр хамаарал байна гэж гарсан бол яг хичнээн хүчтэй хамаарал вэ? гэдгийг хардаг. 0 бол хамаарал байхгүй, 1 бол маш хүчтэй хамаарал."
+    )
     st.write(f"**Cramér’s V:** {cramers_v:.3f} (0=хамааралгүй, 1=хүчтэй хамаарал)")
     if cramers_v < 0.1:
         st.info("Бараг хамааралгүй. (Сул хамаарлаас доогуур)")
