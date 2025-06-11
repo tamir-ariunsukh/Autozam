@@ -16,6 +16,7 @@ from sklearn.tree import DecisionTreeRegressor
 from sklearn.neighbors import KNeighborsRegressor
 from sklearn.svm import SVR
 from sklearn.neural_network import MLPRegressor
+from sklearn.preprocessing import MinMaxScaler
 from xgboost import XGBRegressor
 from lightgbm import LGBMRegressor
 from catboost import CatBoostRegressor
@@ -341,8 +342,7 @@ st.title("Зам тээврийн ослуудын шинжилгээ (2022-2024
 st.header("5. Ирээдүйн ослын таамаглал (Олон ML/DL загвар)")
 st.write("13 төрлийн ML/DL/ANN/NN моделийн таамаглалыг нэг дор үзүүлнэ.")
 
-# ----------- ТАЙЛБАР -----------
-# Моделийн нэрс:
+
 MODEL_LIST = [
     ("LinearRegression", LinearRegression()),
     ("Ridge", Ridge()),
@@ -356,38 +356,127 @@ MODEL_LIST = [
     ("SVR", SVR()),
     ("MLPRegressor", MLPRegressor(hidden_layer_sizes=(64, 32), max_iter=1000)),
     ("XGBRegressor", XGBRegressor(verbosity=0)),
-   
     ("CatBoostRegressor", CatBoostRegressor(verbose=0)),
-  
 ]
 
 # ----------- Өгөгдөл бэлтгэх -----------
-# Жил, сар, өдрөөр ослын тоог нэгтгэх
 forecast_col = "Осол"
 grouped = df[df[forecast_col]==1].groupby(["Year", "Month"]).agg(osol_count=(forecast_col, "sum")).reset_index()
-# Прогноз хийхэд цаг хугацаа индекс болгоно
 grouped["date"] = pd.to_datetime(grouped[["Year", "Month"]].assign(DAY=1))
-grouped = grouped.sort_values("date").reset_index(drop=True)
+weather_cols = [
+    "Авто зам - Үзэгдэх орчин Чөлөөтэй",
+    "Авто зам - Үзэгдэх орчин Зорчих хэсэг гэрэлтүүлэггүй",
+    "Авто зам - Үзэгдэх орчин Зорчих хэсэг гэрэгтүүлэгтэй",
+    "Авто зам - Үзэгдэх орчин Хязгаарлагдмал",
+    "Авто зам - Үзэгдэх орчин Хангалтгүй",
+    "Авто зам - Үзэгдэх орчин Бүрэнхий",
+    "Авто зам - Үзэгдэх орчин Саад байсан",
+    "Авто зам - Үзэгдэх орчин Манантай",
+    "Авто зам - Цаг агаар Таатай",
+    "Авто зам - Цаг агаар Үүлэрхэг",
+    "Авто зам - Цаг агаар Цастай",
+    "Авто зам - Цаг агаар Шуургатай",
+    "Авто зам - Цаг агаар Манантай",
+    "Авто зам - Цаг агаар Бороотой",
+        "Авто зам - Замын онцлог Тэгш",
+    "Авто зам - Замын онцлог Уруу",
+    "Авто зам - Замын онцлог Өгсүүр",
+    "Авто зам - Замын онцлог Шулуун",
+    "Авто зам - Замын онцлог Хазгай",
+    "Авто зам - Замын онцлог Огцом эргэлттэй",
+    "Авто зам - Замын онцлог Налуу",
+    "Авто зам - Замын онцлог Алсуур эргэлттэй",
+        "Авто зам - Замын гадаргуу Хуурай",
+    "Авто зам - Замын гадаргуу Мөстэй",
+    "Авто зам - Замын гадаргуу Нойтон",
+    "Авто зам - Замын гадаргуу Цастай",
+    "Авто зам - Замын гадаргуу Эдрэлтэй",
+    "Авто зам - Замын гадаргуу Бохирдсон",
+    "Авто зам - Замын хэсэг Уулзвар",
+    "Авто зам - Замын хэсэг Бусад",
+    "Авто зам - Замын хэсэг Гүүр",
+    "Авто зам - Замын хэсэг Автобусны буудал",
+    "Авто зам - Замын хэсэг Гарц",
+    "Авто зам - Замын хэсэг Хонгил",
+    "Авто зам - Замын хэсэг Төмөр замын гарам",
+    "Авто зам - Замын хэсэг Зорчих хэсэг",
+    "Авто зам - Замын хэсэг Тусгаарлах зурвас",
+    "Авто зам - Замын хэсэг Түр зам",
+    "Авто зам - Замын хэсэг Явган хүний зам дээр",
+    "Авто зам - Замын хэсэг Сургууль орчимын зам",
+    "Авто зам - Замын хэсэг Зогсоолын талбай",
+    "Авто зам - Замын хэсэг Зорчих хэсгийн хөвөө",
+    "Авто зам - Замын хэсэг Туслах зам",
+    "Авто зам - Замын хэсэг Зам, барилгын ажлын талбай",
+     "Авто зам - Осолд нөлөөлөх хүчин зүйл Зам дээр саад байсан",
+    "Авто зам - Осолд нөлөөлөх хүчин зүйл Гэрэл шилжүүлээгүй",
+    "Авто зам - Осолд нөлөөлөх хүчин зүйл Хэт ядарсанаас",
+    "Авто зам - Осолд нөлөөлөх хүчин зүйл Согтуугаар тээврийн хэрэгсэл жолоодсоноос",
+    "Авто зам - Осолд нөлөөлөх хүчин зүйл Нойрмоглосоноос",
+    "Авто зам - Осолд нөлөөлөх хүчин зүйл Замын нөхцөлөөс",
+    "Авто зам - Осолд нөлөөлөх хүчин зүйл Гар утас хэрэглэж байснаас",
+    "Авто зам - Осолд нөлөөлөх хүчин зүйл Буруу дохио, анхааруулга өгсөн",
+    "Авто зам - Осолд нөлөөлөх хүчин зүйл Замын гадаргуу хальтиргаа, гулгаатай",
+    "Авто зам - Осолд нөлөөлөх хүчин зүйл Сэтгэл зүйн байдлаас",
+    "Авто зам - Осолд нөлөөлөх хүчин зүйл Дугуйн зам байхгүй байснаас",
+    "Авто зам - Осолд нөлөөлөх хүчин зүйл Зам орчин хангалтгүй байсанаас",
+    "Авто зам - Осолд нөлөөлөх хүчин зүйл Эрхэлсэн ажил мэргэжилээс",
+    "Авто зам - Осолд нөлөөлөх хүчин зүйл Мансуурсанаас",
+    "Авто зам - Ослын нөхцөл Хоёр тээврийн хэрэгсэл холбогдсон осол",
+    "Авто зам - Ослын нөхцөл Нэг тээврийн хэрэгсэл холбогдсон осол",
+    "Авто зам - Ослын нөхцөл Гурав бас түүнээс дээш тээврийн хэрэгсэл холбогдсон осол",
+]
 
-# Feature бэлтгэх
-n_lag =24 # 12 сараар лаг хийнэ (онцлог)
+# Сар бүр агрегатлах (sum хийх)
+monthly_weather = df.groupby(['Year', 'Month'])[weather_cols].sum().reset_index()
+
+# Үндсэн grouped датафреймтэй merge хийх (Year, Month-оор)
+grouped = pd.merge(grouped, monthly_weather, on=['Year', 'Month'], how='left')
+
+# Lag-уудыг үүсгэнэ
+n_lag = 12
 for i in range(1, n_lag+1):
     grouped[f"osol_lag_{i}"] = grouped["osol_count"].shift(i)
 grouped = grouped.dropna().reset_index(drop=True)
 
-# X, y
-X = grouped[[f"osol_lag_{i}" for i in range(1, n_lag+1)]].values
-y = grouped["osol_count"].values
+# X, y matrix-д lag болон цаг агаарын хувьсагчдыг хамтад нь оруулна
+X = grouped[[f"osol_lag_{i}" for i in range(1, n_lag+1)] + weather_cols].values
+y = grouped["osol_count"].values.reshape(-1, 1)
 
-# TRAIN/TEST (last 12 months as test)
-train_size = int(len(X) * 0.8)
-X_train, y_train = X[:train_size], y[:train_size]
-X_test, y_test = X[train_size:], y[train_size:]
+# ---------- СКЭЙЛИНГ (ЗААВАЛ) ----------
+scaler_X = MinMaxScaler()
+scaler_y = MinMaxScaler()
+X_scaled = scaler_X.fit_transform(X)
+y_scaled = scaler_y.fit_transform(y)
 
-# ------- Олон моделийн сургаж таамаглах (SKLearn) -------
+# ---------- TRAIN/TEST ----------
+train_size = int(len(X_scaled) * 0.8)
+X_train, y_train = X_scaled[:train_size], y_scaled[:train_size].flatten()
+X_test, y_test = X_scaled[train_size:], y_scaled[train_size:].flatten()
+
+# --- Модел жагсаалт ---
+MODEL_LIST = [
+    ("LinearRegression", LinearRegression()),
+    ("Ridge", Ridge()),
+    ("Lasso", Lasso()),
+    ("DecisionTree", DecisionTreeRegressor()),
+    ("RandomForest", RandomForestRegressor()),
+    ("ExtraTrees", ExtraTreesRegressor()),
+    ("GradientBoosting", GradientBoostingRegressor()),
+    ("AdaBoost", AdaBoostRegressor()),
+    ("KNeighbors", KNeighborsRegressor()),
+    ("SVR", SVR()),
+    ("MLPRegressor", MLPRegressor(hidden_layer_sizes=(64, 32), max_iter=1000)),
+    ("XGBRegressor", XGBRegressor(verbosity=0)),
+    ("CatBoostRegressor", CatBoostRegressor(verbose=0)),
+]
+
+progress_bar = st.progress(0, text="ML моделийг сургаж байна...")
+
+# ------- Олон моделийг сургах/таамаглах -------
 results = []
 y_preds = {}
-for name, model in MODEL_LIST:
+for i, (name, model) in enumerate(MODEL_LIST):
     model.fit(X_train, y_train)
     y_pred = model.predict(X_test)
     y_preds[name] = y_pred
@@ -396,19 +485,18 @@ for name, model in MODEL_LIST:
     rmse = np.sqrt(mse)
     r2 = r2_score(y_test, y_pred)
     results.append({"Model": name, "MAE": mae, "RMSE": rmse, "R2": r2})
-
-
+    progress = min(int((i+1) / len(MODEL_LIST) * 100), 100)
+    progress_bar.progress(progress, text=f"{name} дууслаа")
+progress_bar.empty()
+st.success("Бүх ML модел сургагдлаа!")
 
 # ----------- Метрик харуулах, Excel рүү татах -----------
-
 results_df = pd.DataFrame(results)
 st.dataframe(results_df)
 
-# Excel татах
 excel_buffer = pd.ExcelWriter("model_metrics.xlsx", engine="xlsxwriter")
 results_df.to_excel(excel_buffer, index=False)
 excel_buffer.close()
-
 with open("model_metrics.xlsx", "rb") as f:
     st.download_button(
         label="Моделийн метрик Excel татах",
@@ -418,6 +506,8 @@ with open("model_metrics.xlsx", "rb") as f:
     )
 
 # ----------- Ирээдүйн 30, 90, 180, 365 хоногийн прогноз -----------
+forecast_steps = {"30 хоног": 1, "90 хоног": 3, "180 хоног": 6, "365 хоног": 12}
+
 def forecast_next(model, last_values, steps=12):
     preds = []
     input_seq = last_values.copy()
@@ -426,49 +516,43 @@ def forecast_next(model, last_values, steps=12):
         preds.append(pred)
         input_seq = np.roll(input_seq, -1)
         input_seq[-1] = pred
-    return preds
+    return np.array(preds)
 
-
-
-# Бүх моделийн ирээдүйн прогноз хадгалах
 model_forecasts = {}
-
-last_seq = X_test[-1]  # хамгийн сүүлийн үеийн 12 сар
+last_seq = X_scaled[-1]  # хамгийн сүүлийн 12 сар (scaled)
 
 for name, model in MODEL_LIST:
     preds_dict = {}
-    forecast_steps = {"30 хоног": 1, "90 хоног": 3, "180 хоног": 6, "365 хоног": 12}
-
     for k, s in forecast_steps.items():
-        preds_dict[k] = forecast_next(model, last_seq, steps=s)
+        scaled_preds = forecast_next(model, last_seq, steps=s)
+        # Inverse scale to real values
+        # Бүх таамаглалыг scaler_y-р бодит утга руу хөрвүүлнэ
+        inv_preds = scaler_y.inverse_transform(scaled_preds.reshape(-1, 1)).flatten()
+        preds_dict[k] = inv_preds
     model_forecasts[name] = preds_dict
-
-
 
 # --- 1. Test set дээрх бодит болон таамагласан ослын тоо (модел бүрээр) ---
 test_dates = grouped["date"].iloc[-len(X_test):].values
-test_true = y_test
+test_true = scaler_y.inverse_transform(y_test.reshape(-1, 1)).flatten()  # inverse scale
 
 test_preds_df = pd.DataFrame({'date': test_dates, 'real': test_true})
 for name in MODEL_LIST:
-    test_preds_df[name[0]] = y_preds[name[0]]
+    y_pred_inv = scaler_y.inverse_transform(y_preds[name[0]].reshape(-1, 1)).flatten()
+    test_preds_df[name[0]] = y_pred_inv
 
 # --- 2. Ирээдүйн forecast (12 сар) модель бүрээр ---
-forecast_steps = {"30 хоног": 1, "90 хоног": 3, "180 хоног": 6, "365 хоног": 12}
-last_seq = X_test[-1]
-
 future_dates = pd.date_range(start=grouped["date"].iloc[-1]+pd.offsets.MonthBegin(), periods=12, freq="MS")
 future_preds_df = pd.DataFrame({'date': future_dates})
 for name, model in MODEL_LIST:
-    preds = forecast_next(model, last_seq, steps=12)
-    future_preds_df[name] = preds
+    scaled_preds = forecast_next(model, last_seq, steps=12)
+    inv_preds = scaler_y.inverse_transform(scaled_preds.reshape(-1, 1)).flatten()
+    future_preds_df[name] = inv_preds
 
 # --- 3. Excel файлд export хийх (хоёр sheet-тэй: test болон ирээдүй) ---
 with pd.ExcelWriter("model_predictions.xlsx", engine="xlsxwriter") as writer:
     test_preds_df.to_excel(writer, index=False, sheet_name="Test_Predictions")
     future_preds_df.to_excel(writer, index=False, sheet_name="Future_Predictions")
 
-# --- 4. Streamlit-р Excel татуулах ---
 with open("model_predictions.xlsx", "rb") as f:
     st.download_button(
         label="Test/Forecast бүх моделийн таамаглалуудыг Excel-р татах",
@@ -477,13 +561,10 @@ with open("model_predictions.xlsx", "rb") as f:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
-# --- 5. Streamlit дээр харагдах preview (жишээ нь тестийн эхний 10 мөр) ---
 st.subheader("Test датан дээрх модел бүрийн бодит болон таамагласан утгууд:")
 st.dataframe(test_preds_df.head(10))
-
 st.subheader("Ирээдүйн 12 сарын прогноз (модел бүрээр):")
 st.dataframe(future_preds_df)
-
 
 # ----------- 1 жилийн прогноз график (модел сонгох) -----------
 st.subheader("1 жилийн прогноз график (модел бүрээр):")
@@ -492,8 +573,11 @@ future = model_forecasts[selected_model]["365 хоног"]
 dates_future = pd.date_range(start=grouped["date"].iloc[-1]+pd.offsets.MonthBegin(), periods=12, freq="MS")
 future_df = pd.DataFrame({"date": dates_future, "forecast": future})
 
+import plotly.express as px
 fig = px.line(future_df, x="date", y="forecast", markers=True, title=f"{selected_model}-ийн ирэх 12 сарын прогноз")
 st.plotly_chart(fig, use_container_width=True)
+
+
 
 # ----------- Газрын зураг дээр анхаарах байршил -----------
 
@@ -1457,6 +1541,8 @@ if var1 and var2:
     cramers_v = np.sqrt(chi2 / (n * (min(k, r) - 1))) if min(k, r) > 1 else np.nan
 
     st.subheader("1. Chi-square тест")
+    st.write("Категори (чанарын) өгөгдөл хоорондоо хамааралтай эсэхийг шалгадаг статистикийн тест.Жишээ: Хүйс (эрэгтэй/эмэгтэй) болон Тамхи татдаг эсэх (тийм/үгүй) хоёр хувьсагч хооронд хамаарал байна уу гэдгийг мэдэх. p-value < 0.05 бол хамааралтай гэж үздэг (өөрөөр хэлбэл, санамсаргүй тохиолдол биш)")
+
     st.write(f"**Chi-square statistic:** {chi2:.3f}")
     st.write(f"**p-value:** {p:.4f}")
     if p < 0.05:
@@ -1465,6 +1551,8 @@ if var1 and var2:
         st.info("p ≥ 0.05 → Статистикийн хувьд хамааралгүй.")
 
     st.subheader("2. Cramér’s V")
+
+    st.write("Chi-square тестийн гарсан үр дүнг 0-ээс 1 хүртэл хэмжигдэх “хүчтэй эсэх” буюу хамаарлын хүчийг хэмждэг коэффициент.Chi-square тестээр хамаарал байна гэж гарсан бол яг хичнээн хүчтэй хамаарал вэ? гэдгийг хардаг. 0 бол хамаарал байхгүй, 1 бол маш хүчтэй хамаарал.")
     st.write(f"**Cramér’s V:** {cramers_v:.3f} (0=хамааралгүй, 1=хүчтэй хамаарал)")
     if cramers_v < 0.1:
         st.info("Бараг хамааралгүй. (Сул хамаарлаас доогуур)")
@@ -1474,7 +1562,5 @@ if var1 and var2:
         st.info("Дунд зэрэг хамааралтай")
     else:
         st.success("Их хамааралтай")
-
-    # Crosstab харуулах
     st.write("**Crosstab:**")
     st.dataframe(table)
