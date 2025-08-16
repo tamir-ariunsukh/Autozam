@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 # ============================================================
 # Зам тээврийн осол — Auto ML & Hotspot Dashboard (Streamlit)
-# Хувилбар: 2025-08-17 — Binary autodetect + robust column resolver + target UI
+# Хувилбар: 2025-08-17b — Leakage-free scaling, 200-row quick sample, bias-corrected Cramér's V
 # Тайлбар:
 #  - Хавсаргасан Excel ("кодлогдсон - Copy.xlsx")-тай шууд зохицно.
 #  - Binary (0/1) бүх баганыг автоматаар илрүүлж, модел/корреляц/хотспотод ашиглана.
 #  - Координат баганууд (Өргөрөг/Уртраг эсвэл lat/lon) байвал газрын зураг зурна.
 #  - Олон ML модел сургалт, метрик/таамаглалыг Excel болгон татах боломжтой.
 #  - "Осол" багана байхгүй тохиолдолд "Төрөл"-өөс (Гэмт хэрэг/Зөрчлийн хэрэг) зорилтыг үүсгэнэ.
+#  - Шинэчлэлтүүд: (i) scaler-ийг train-д л fit хийж data leakage арилгав, (ii) 200 мөрийн хурдан ажиллуулах сонголт, (iii) Cramér's V-ийн bias-corrected хувилбар нэмэв.
 # Гүйцэтгэх: streamlit run osol_auto_streamlit.py
 # ============================================================
 
@@ -115,13 +116,26 @@ def plot_correlation_matrix(df, title, columns):
     for col in df_encoded.columns:
         if df_encoded[col].dtype == "object":
             df_encoded[col] = pd.Categorical(df_encoded[col]).codes
-    corr_matrix = df_encoded.corr()
+    corr_matrix = df_encoded.corr(numeric_only=True)
     corr_matrix = corr_matrix.iloc[::-1]
     fig, ax = plt.subplots(figsize=(max(8, 1.5*len(columns)), max(6, 1.2*len(columns))))
     sns.heatmap(corr_matrix, annot=True, cmap="coolwarm", vmin=-1, vmax=1, center=0, ax=ax, fmt=".3f")
     plt.title(title)
     plt.tight_layout()
     return fig
+
+# Bias-corrected Cramér's V (Bergsma, 2013)
+
+def cramers_v_bias_corrected(table: pd.DataFrame) -> float:
+    chi2, _, _, _ = chi2_contingency(table)
+    n = table.values.sum()
+    phi2 = chi2 / max(n, 1)
+    r, k = table.shape
+    phi2_corr = max(0, phi2 - (k-1)*(r-1)/(max(n-1, 1)))
+    r_corr = r - (r-1)**2 / max(n-1, 1)
+    k_corr = k - (k-1)**2 / max(n-1, 1)
+    denom = max(min(k_corr-1, r_corr-1), 1e-12)
+    return float(np.sqrt(phi2_corr / denom))
 
 # -------------------------- Өгөгдөл ачаалалт --------------------------
 
@@ -137,7 +151,6 @@ def load_data(default_path: str = "кодлогдсон.xlsx"):
     if up is not None:
         df = pd.read_excel(up)
     else:
-        # Канвас дээрхтэй адил замаас унших
         local = Path("/mnt/data/кодлогдсон - Copy.xlsx")
         if local.exists():
             df = pd.read_excel(local)
@@ -178,7 +191,6 @@ def load_data(default_path: str = "кодлогдсон.xlsx"):
     exclude = {"Зөрчил огноо", "Year", "Month", "Day", "д/д", "Хороо-Сум", "Аймаг-Дүүрэг"}
     if lat_col: exclude.add(lat_col)
     if lon_col: exclude.add(lon_col)
-    # 'Осол' одооноос үүсэх тул энд бүртгэхгүй, дараа нь feature_pool-д багтвал bug болно
     binary_cols = [c for c in df.columns if c not in exclude and is_binary_series(df[c])]
 
     # Нэмэлт тоон candidate-ууд
@@ -202,6 +214,14 @@ lat_col, lon_col = meta["lat_col"], meta["lon_col"]
 binary_cols = meta["binary_cols"]
 num_additional = meta["numeric_candidates"]
 years = meta["years"]
+
+# -------------------------- Sidebar: Sampling & Seed --------------------------
+
+st.sidebar.markdown("### ⚙️ Ашиглалтын тохиргоо")
+seed = int(st.sidebar.number_input("Random seed", value=42, step=1))
+quick_sample = st.sidebar.checkbox("⚡ 200 мөрөөр хурдан ажиллуулах (санамсаргүй)", value=False)
+if quick_sample and len(df) > 200:
+    df = df.sample(n=200, random_state=seed).sort_values("Зөрчил огноо")
 
 # -------------------------- Target тохиргоо --------------------------
 
@@ -227,7 +247,7 @@ else:  # Зөвхөн Зөрчлийн хэрэг
 # -------------------------- 5. Ирээдүйн ослын таамаглал --------------------------
 
 st.header("5. Ирээдүйн ослын таамаглал (Олон ML/DL загвар)")
-st.caption("Binary (0/1) багануудыг автоматаар илрүүлж, загварт ашигласан.")
+st.caption("Binary (0/1) багануудыг автоматаар илрүүлж, загварт ашигласан. Leakage-free scaling хэрэглэсэн.")
 
 # Feature pool: 'Осол'-оос бусад binary + нэмэлт тоон
 feature_pool = [c for c in (binary_cols + num_additional) if c != "Осол"]
@@ -241,7 +261,7 @@ X_all = df[feature_pool].fillna(0.0).values
 
 # Top features via RandomForest
 try:
-    rf_global = RandomForestRegressor(n_estimators=300, random_state=42)
+    rf_global = RandomForestRegressor(n_estimators=300, random_state=seed)
     rf_global.fit(X_all, y_all)
     importances = rf_global.feature_importances_
     indices = np.argsort(importances)[::-1]
@@ -277,48 +297,50 @@ if grouped.empty or len(grouped) < 10:
 else:
     feature_cols = [f"osol_lag_{i}" for i in range(1, n_lag + 1)] + top_features
     X = grouped[feature_cols].fillna(0.0).values
-    y = grouped["osol_count"].values.reshape(-1, 1)
+    y = grouped["osol_count"].astype(float).values.reshape(-1, 1)
 
-    # Scale
+    # ---------------- Leakage-free scaling ----------------
+    split_ratio = st.sidebar.slider("Train ratio", 0.5, 0.9, 0.8, 0.05)
+    train_size = int(len(X) * split_ratio)
+
+    X_train_raw, X_test_raw = X[:train_size], X[train_size:]
+    y_train_raw, y_test_raw = y[:train_size], y[train_size:]
+
     scaler_X = MinMaxScaler()
     scaler_y = MinMaxScaler()
-    X_scaled = scaler_X.fit_transform(X)
-    y_scaled = scaler_y.fit_transform(y)
-
-    # Train/Test split (time order)
-    split_ratio = st.sidebar.slider("Train ratio", 0.5, 0.9, 0.8, 0.05)
-    train_size = int(len(X_scaled) * split_ratio)
-    X_train, y_train = X_scaled[:train_size], y_scaled[:train_size].flatten()
-    X_test, y_test = X_scaled[train_size:], y_scaled[train_size:].flatten()
+    X_train = scaler_X.fit_transform(X_train_raw)
+    X_test  = scaler_X.transform(X_test_raw)
+    y_train = scaler_y.fit_transform(y_train_raw).flatten()
+    y_test  = scaler_y.transform(y_test_raw).flatten()
 
     estimators = [
-        ("rf", RandomForestRegressor(n_estimators=120, random_state=42)),
+        ("rf", RandomForestRegressor(n_estimators=120, random_state=seed)),
         ("ridge", Ridge()),
-        ("dt", DecisionTreeRegressor(random_state=42)),
+        ("dt", DecisionTreeRegressor(random_state=seed)),
     ]
 
     MODEL_LIST = [
         ("LinearRegression", LinearRegression()),
         ("Ridge", Ridge()),
         ("Lasso", Lasso()),
-        ("DecisionTree", DecisionTreeRegressor(random_state=42)),
-        ("RandomForest", RandomForestRegressor(random_state=42)),
-        ("ExtraTrees", ExtraTreesRegressor(random_state=42)),
-        ("GradientBoosting", GradientBoostingRegressor(random_state=42)),
-        ("HistGB", HistGradientBoostingRegressor(random_state=42)),
-        ("AdaBoost", AdaBoostRegressor(random_state=42)),
+        ("DecisionTree", DecisionTreeRegressor(random_state=seed)),
+        ("RandomForest", RandomForestRegressor(random_state=seed)),
+        ("ExtraTrees", ExtraTreesRegressor(random_state=seed)),
+        ("GradientBoosting", GradientBoostingRegressor(random_state=seed)),
+        ("HistGB", HistGradientBoostingRegressor(random_state=seed)),
+        ("AdaBoost", AdaBoostRegressor(random_state=seed)),
         ("KNeighbors", KNeighborsRegressor()),
         ("SVR", SVR()),
-        ("MLPRegressor", MLPRegressor(hidden_layer_sizes=(64, 32), max_iter=800, random_state=42)),
+        ("MLPRegressor", MLPRegressor(hidden_layer_sizes=(64, 32), max_iter=800, random_state=seed)),
         ("ElasticNet", ElasticNet()),
         ("Stacking", StackingRegressor(estimators=estimators, final_estimator=LinearRegression(), cv=5)),
     ]
     if XGBRegressor is not None:
-        MODEL_LIST.append(("XGBRegressor", XGBRegressor(verbosity=0, random_state=42)))
+        MODEL_LIST.append(("XGBRegressor", XGBRegressor(verbosity=0, random_state=seed)))
     if CatBoostRegressor is not None:
-        MODEL_LIST.append(("CatBoostRegressor", CatBoostRegressor(verbose=0, random_state=42)))
+        MODEL_LIST.append(("CatBoostRegressor", CatBoostRegressor(verbose=0, random_state=seed)))
     if LGBMRegressor is not None:
-        MODEL_LIST.append(("LGBMRegressor", LGBMRegressor(random_state=42)))
+        MODEL_LIST.append(("LGBMRegressor", LGBMRegressor(random_state=seed)))
 
     progress_bar = st.progress(0, text="ML моделийг сургаж байна...")
     results = []
@@ -330,7 +352,6 @@ else:
             y_pred = model.predict(X_test)
             y_preds[name] = y_pred
             mae = mean_absolute_error(y_test, y_pred)
-
             mse = mean_squared_error(y_test, y_pred)
             rmse = float(np.sqrt(mse))
             r2 = r2_score(y_test, y_pred)
@@ -370,7 +391,7 @@ else:
 
     forecast_steps = {"30 хоног": 1, "90 хоног": 3, "180 хоног": 6, "365 хоног": 12}
     model_forecasts = {}
-    last_seq = X_scaled[-1]
+    last_seq = scaler_X.transform(X[-1].reshape(1, -1)).flatten()
 
     for name, model in MODEL_LIST:
         if name not in y_preds:
@@ -491,7 +512,7 @@ if len(vars_for_corr) > 1:
     Xx = df[vars_for_corr].fillna(0.0).values
     yy = pd.to_numeric(df["Осол"], errors="coerce").fillna(0).values
     try:
-        rf_cor = RandomForestRegressor(n_estimators=200, random_state=42)
+        rf_cor = RandomForestRegressor(n_estimators=200, random_state=seed)
         rf_cor.fit(Xx, yy)
         importances_cor = rf_cor.feature_importances_
         indices_cor = np.argsort(importances_cor)[::-1]
@@ -561,9 +582,12 @@ else:
 
     table = pd.crosstab(df[var1], df[var2])
     chi2, p, dof, expected = chi2_contingency(table)
+
+    # Хоёр хувилбарын V
     n = table.values.sum()
     r, k = table.shape
-    cramers_v = np.sqrt(chi2 / (n * (min(k, r) - 1))) if min(k, r) > 1 else np.nan
+    cramers_v_naive = np.sqrt(chi2 / (n * (min(k, r) - 1))) if min(k, r) > 1 else np.nan
+    cramers_v_bc = cramers_v_bias_corrected(table)
 
     st.subheader("1. Chi-square тест")
     st.write("p-value < 0.05 бол статистикийн хувьд хамааралтай гэж үзнэ.")
@@ -574,9 +598,12 @@ else:
     else:
         st.info("p ≥ 0.05 → Статистикийн хувьд хамааралгүй.")
 
+    use_bc = st.checkbox("Bias-corrected Cramér’s V (санал болгож байна)", value=True)
+    v_to_show = cramers_v_bc if use_bc else cramers_v_naive
+
     st.subheader("2. Cramér’s V")
     st.write("0-д ойрхон бол бараг хамааралгүй, 1-д ойр бол хүчтэй хамааралтай.")
-    st.write(f"**Cramér’s V:** {cramers_v:.3f} (0=хамааралгүй, 1=хүчтэй хамаарал)")
+    st.write(f"**Cramér’s V:** {v_to_show:.3f} (0=хамааралгүй, 1=хүчтэй хамаарал)")
 
     st.write("**Crosstab:**")
     st.dataframe(table, use_container_width=True)
@@ -588,7 +615,8 @@ st.markdown(
     ---
     **Тайлбар**  
     • Зорилтот хувьсагчийг Sidebar дээрээс сонгох боломжтой (Гэмт хэрэг/Зөрчлийн хэрэг/Хосолсон).  
-    • Том хэмжээтэй файлуудад `@st.cache_data` ачааллааг бууруулна.  
+    • "Leakage-free" scaling: scaler-уудыг зөвхөн train дээр fit хийдэг тул үнэлгээ илүү найдвартай.  
+    • ⚡ Хурдан ажиллуулахад 200 мөрийн санамсаргүй дэд дээж авч туршина.  
     • Хэрэв XGBoost/LightGBM/CatBoost суулгагдаагүй бол суулгалгүйгээр бусад моделүүд ажиллана.  
     """
 )
