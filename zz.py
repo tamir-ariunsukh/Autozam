@@ -140,7 +140,7 @@ def cramers_v_bias_corrected(table: pd.DataFrame) -> float:
 # -------------------------- Өгөгдөл ачаалалт --------------------------
 
 @st.cache_data(show_spinner=True)
-def load_data(default_path: str = "кодлогдсон.xlsx"):
+def load_data(default_path: str = "кодлогдсон - Copy.xlsx"):
     """
     - Sidebar дээрээс .xlsx файлаар upload хийж болно.
     - Хэрэв оруулаагүй бол default_path-ыг уншина.
@@ -171,6 +171,7 @@ def load_data(default_path: str = "кодлогдсон.xlsx"):
     df["Year"]  = df["Зөрчил огноо"].dt.year
     df["Month"] = df["Зөрчил огноо"].dt.month
     df["Day"]   = df["Зөрчил огноо"].dt.day_name()
+    df["Date"] = df["Зөрчил огноо"].dt.normalize()
 
     # Он жилүүдийн one-hot
     years = sorted(df["Year"].dropna().unique().tolist())
@@ -245,206 +246,164 @@ else:  # Зөвхөн Зөрчлийн хэрэг
     df["Осол"] = (df[torol_col] == "Зөрчлийн хэрэг").astype(int)
 
 # -------------------------- 5. Ирээдүйн ослын таамаглал --------------------------
+# -------------------------- 5. Ирээдүйн ослын ТАМАГЛАЛ — ӨДӨР БҮР --------------------------
 
-st.header("5. Ирээдүйн ослын таамаглал (Олон ML/DL загвар)")
-st.caption("Binary (0/1) багануудыг автоматаар илрүүлж, загварт ашигласан. Leakage-free scaling хэрэглэсэн.")
+st.header("5. Ирээдүйн ослын ТАМАГЛАЛ — ӨДӨР БҮР")
+st.caption("Загвар нь зөвхөн лагууд (өмнөх өдрүүдийн ослын тоо) + календарын шинжүүдийг (7 хоногийн өдөр) ашиглана.")
 
-# Feature pool: 'Осол'-оос бусад binary + нэмэлт тоон
-feature_pool = [c for c in (binary_cols + num_additional) if c != "Осол"]
-if len(feature_pool) == 0:
-    st.error("Binary (0/1) хэлбэрийн багана олдсонгүй. Excel-ээ шалгана уу.")
+# Өдөр бүрийн цуваа
+series_day = (
+    df[df["Осол"] == 1]
+    .groupby("Date")["Осол"].sum()
+)
+if series_day.empty:
+    st.error("Өдөр бүрийн ослын тоо үүсгэхэд өгөгдөл алга.")
     st.stop()
 
-# Target/Features
-y_all = pd.to_numeric(df["Осол"], errors="coerce").fillna(0).values
-X_all = df[feature_pool].fillna(0.0).values
+full_dates = pd.date_range(series_day.index.min(), series_day.index.max(), freq="D")
+day_df = pd.DataFrame(index=full_dates)
+day_df["osol_count"] = series_day.reindex(full_dates, fill_value=0).astype(float)
 
-# Top features via RandomForest
-try:
-    rf_global = RandomForestRegressor(n_estimators=300, random_state=seed)
-    rf_global.fit(X_all, y_all)
-    importances = rf_global.feature_importances_
-    indices = np.argsort(importances)[::-1]
-    top_k = min(14, len(feature_pool))
-    top_features = [feature_pool[i] for i in indices[:top_k]]
-    st.caption("RandomForest-аар сонгосон нөлөө ихтэй шинжүүд:")
-    st.write(top_features)
-except Exception as e:
-    st.warning(f"Top features тооцоход алдаа гарлаа: {e}")
-    top_features = feature_pool[:min(14, len(feature_pool))]
-
-# Сар бүрийн агрегат (target=Осол==1 давтамж)
-monthly_target = (
-    df[df["Осол"] == 1]
-    .groupby(["Year", "Month"])
-    .agg(osol_count=("Осол", "sum"))
-    .reset_index()
-)
-monthly_target["date"] = pd.to_datetime(monthly_target[["Year", "Month"]].assign(DAY=1))
-monthly_features = df.groupby(["Year", "Month"])[top_features].sum().reset_index()
-
-grouped = pd.merge(monthly_target, monthly_features, on=["Year", "Month"], how="left").sort_values("date").reset_index(drop=True)
-
-# Lag үүсгэх
-n_lag = st.sidebar.slider("Сарны лаг цонх (n_lag)", min_value=6, max_value=18, value=12, step=1)
+# Лагууд (өдөр)
+n_lag = st.sidebar.slider("Өдөрийн лаг цонх (n_lag)", min_value=7, max_value=90, value=30, step=1)
 for i in range(1, n_lag + 1):
-    grouped[f"osol_lag_{i}"] = grouped["osol_count"].shift(i)
+    day_df[f"lag_{i}"] = day_df["osol_count"].shift(i)
 
-grouped = grouped.dropna().reset_index(drop=True)
+# Календарын шинжүүд (долоо хоногийн өдөр)
+dow = day_df.index.dayofweek
+for j in range(7):
+    day_df[f"dow_{j}"] = (dow == j).astype(int)
 
-if grouped.empty or len(grouped) < 10:
-    st.warning(f"Сургалт хийхэд хангалттай сар тутмын өгөгдөл алга (lag={n_lag}). Он/сараа шалгана уу.")
-else:
-    feature_cols = [f"osol_lag_{i}" for i in range(1, n_lag + 1)] + top_features
-    X = grouped[feature_cols].fillna(0.0).values
-    y = grouped["osol_count"].astype(float).values.reshape(-1, 1)
+model_df = day_df.dropna().copy()
+feature_cols = [f"lag_{i}" for i in range(1, n_lag + 1)] + [f"dow_{j}" for j in range(7)]
+X_all = model_df[feature_cols].values
+y_all = model_df["osol_count"].values.reshape(-1, 1)
 
-    # ---------------- Leakage-free scaling ----------------
-    split_ratio = st.sidebar.slider("Train ratio", 0.5, 0.9, 0.8, 0.05)
-    train_size = int(len(X) * split_ratio)
+# Leakage-free scaling + time-based split
+split_ratio = st.sidebar.slider("Train ratio (өдөр)", 0.5, 0.95, 0.8, 0.05)
+train_size = int(len(X_all) * split_ratio)
+X_train_raw, X_test_raw = X_all[:train_size], X_all[train_size:]
+y_train_raw, y_test_raw = y_all[:train_size], y_all[train_size:]
 
-    X_train_raw, X_test_raw = X[:train_size], X[train_size:]
-    y_train_raw, y_test_raw = y[:train_size], y[train_size:]
+scaler_X = MinMaxScaler()
+scaler_y = MinMaxScaler()
+X_train = scaler_X.fit_transform(X_train_raw)
+X_test  = scaler_X.transform(X_test_raw)
+y_train = scaler_y.fit_transform(y_train_raw).flatten()
+y_test  = scaler_y.transform(y_test_raw).flatten()
 
-    scaler_X = MinMaxScaler()
-    scaler_y = MinMaxScaler()
-    X_train = scaler_X.fit_transform(X_train_raw)
-    X_test  = scaler_X.transform(X_test_raw)
-    y_train = scaler_y.fit_transform(y_train_raw).flatten()
-    y_test  = scaler_y.transform(y_test_raw).flatten()
+estimators = [
+    ("rf", RandomForestRegressor(n_estimators=120, random_state=seed)),
+    ("ridge", Ridge()),
+    ("dt", DecisionTreeRegressor(random_state=seed)),
+]
 
-    estimators = [
-        ("rf", RandomForestRegressor(n_estimators=120, random_state=seed)),
-        ("ridge", Ridge()),
-        ("dt", DecisionTreeRegressor(random_state=seed)),
-    ]
+MODEL_LIST = [
+    ("LinearRegression", LinearRegression()),
+    ("Ridge", Ridge()),
+    ("Lasso", Lasso()),
+    ("DecisionTree", DecisionTreeRegressor(random_state=seed)),
+    ("RandomForest", RandomForestRegressor(random_state=seed)),
+    ("ExtraTrees", ExtraTreesRegressor(random_state=seed)),
+    ("GradientBoosting", GradientBoostingRegressor(random_state=seed)),
+    ("HistGB", HistGradientBoostingRegressor(random_state=seed)),
+    ("AdaBoost", AdaBoostRegressor(random_state=seed)),
+    ("KNeighbors", KNeighborsRegressor()),
+    ("SVR", SVR()),
+    ("MLPRegressor", MLPRegressor(hidden_layer_sizes=(64, 32), max_iter=800, random_state=seed)),
+    ("ElasticNet", ElasticNet()),
+    ("Stacking", StackingRegressor(estimators=estimators, final_estimator=LinearRegression(), cv=5)),
+]
+if XGBRegressor is not None:
+    MODEL_LIST.append(("XGBRegressor", XGBRegressor(verbosity=0, random_state=seed)))
+if CatBoostRegressor is not None:
+    MODEL_LIST.append(("CatBoostRegressor", CatBoostRegressor(verbose=0, random_state=seed)))
+if LGBMRegressor is not None:
+    MODEL_LIST.append(("LGBMRegressor", LGBMRegressor(random_state=seed)))
 
-    MODEL_LIST = [
-        ("LinearRegression", LinearRegression()),
-        ("Ridge", Ridge()),
-        ("Lasso", Lasso()),
-        ("DecisionTree", DecisionTreeRegressor(random_state=seed)),
-        ("RandomForest", RandomForestRegressor(random_state=seed)),
-        ("ExtraTrees", ExtraTreesRegressor(random_state=seed)),
-        ("GradientBoosting", GradientBoostingRegressor(random_state=seed)),
-        ("HistGB", HistGradientBoostingRegressor(random_state=seed)),
-        ("AdaBoost", AdaBoostRegressor(random_state=seed)),
-        ("KNeighbors", KNeighborsRegressor()),
-        ("SVR", SVR()),
-        ("MLPRegressor", MLPRegressor(hidden_layer_sizes=(64, 32), max_iter=800, random_state=seed)),
-        ("ElasticNet", ElasticNet()),
-        ("Stacking", StackingRegressor(estimators=estimators, final_estimator=LinearRegression(), cv=5)),
-    ]
-    if XGBRegressor is not None:
-        MODEL_LIST.append(("XGBRegressor", XGBRegressor(verbosity=0, random_state=seed)))
-    if CatBoostRegressor is not None:
-        MODEL_LIST.append(("CatBoostRegressor", CatBoostRegressor(verbose=0, random_state=seed)))
-    if LGBMRegressor is not None:
-        MODEL_LIST.append(("LGBMRegressor", LGBMRegressor(random_state=seed)))
+progress_bar = st.progress(0, text="ML моделийг сургаж байна...")
+results, y_preds = [], {}
+for i, (name, model) in enumerate(MODEL_LIST):
+    try:
+        model.fit(X_train, y_train)
+        y_pred = model.predict(X_test)
+        y_preds[name] = y_pred
+        mae = mean_absolute_error(y_test, y_pred)
+        rmse = float(np.sqrt(mean_squared_error(y_test, y_pred)))
+        r2 = r2_score(y_test, y_pred)
+        results.append({"Model": name, "MAE": mae, "RMSE": rmse, "R2": r2})
+    except Exception as e:
+        results.append({"Model": name, "MAE": np.nan, "RMSE": np.nan, "R2": np.nan, "Error": str(e)})
+    progress_bar.progress(min(int((i + 1) / len(MODEL_LIST) * 100), 100), text=f"{name} дууслаа")
+progress_bar.empty()
+st.success("Бүх ML модел сургагдлаа!")
+results_df = pd.DataFrame(results).sort_values("RMSE", na_position="last")
+st.dataframe(results_df, use_container_width=True)
 
-    progress_bar = st.progress(0, text="ML моделийг сургаж байна...")
-    results = []
-    y_preds = {}
+with pd.ExcelWriter("model_metrics_daily.xlsx", engine="xlsxwriter") as writer:
+    results_df.to_excel(writer, index=False)
+with open("model_metrics_daily.xlsx", "rb") as f:
+    st.download_button("Моделийн метрик (өдөр) Excel татах", data=f, file_name="model_metrics_daily.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-    for i, (name, model) in enumerate(MODEL_LIST):
-        try:
-            model.fit(X_train, y_train)
-            y_pred = model.predict(X_test)
-            y_preds[name] = y_pred
-            mae = mean_absolute_error(y_test, y_pred)
-            mse = mean_squared_error(y_test, y_pred)
-            rmse = float(np.sqrt(mse))
-            r2 = r2_score(y_test, y_pred)
-            results.append({"Model": name, "MAE": mae, "RMSE": rmse, "R2": r2})
-        except Exception as e:
-            results.append({"Model": name, "MAE": np.nan, "RMSE": np.nan, "R2": np.nan, "Error": str(e)})
-        progress = min(int((i + 1) / len(MODEL_LIST) * 100), 100)
-        progress_bar.progress(progress, text=f"{name} дууслаа")
+# --- Ирээдүйн өдөр тутмын прогноз (экзоген календар ашиглана) ---
+def _dow_vec(d: int) -> np.ndarray:
+    v = np.zeros(7); 
+    if 0 <= d <= 6: v[d] = 1
+    return v
 
-    progress_bar.empty()
-    st.success("Бүх ML модел сургагдлаа!")
+def forecast_next_daily(model, last_lags_raw: np.ndarray, last_date: pd.Timestamp, steps: int) -> np.ndarray:
+    seq = last_lags_raw.astype(float).copy()   # [lag_1, ..., lag_n]
+    preds_raw, cur_date = [], last_date
+    for _ in range(steps):
+        next_date = cur_date + pd.Timedelta(days=1)
+        x_raw = np.concatenate([seq, _dow_vec(next_date.dayofweek)])
+        x_scaled = scaler_X.transform(x_raw.reshape(1, -1))
+        yhat_scaled = model.predict(x_scaled)[0]
+        yhat_raw = scaler_y.inverse_transform(np.array([[yhat_scaled]])).ravel()[0]
+        preds_raw.append(yhat_raw)
+        seq = np.concatenate([[yhat_raw], seq[:-1]])  # шинэ лаг_1 = өнөөдрийн таамаг
+        cur_date = next_date
+    return np.array(preds_raw)
 
-    results_df = pd.DataFrame(results).sort_values("RMSE", na_position="last")
-    st.dataframe(results_df, use_container_width=True)
+# Test дээрх бодит/таамаг
+idx_all = model_df.index
+test_dates = idx_all[-len(X_test):]
+true_test_raw = scaler_y.inverse_transform(y_test.reshape(-1, 1)).ravel()
+test_preds_df = pd.DataFrame({"date": test_dates, "real": true_test_raw})
+for name, yhat_scaled in y_preds.items():
+    test_preds_df[name] = scaler_y.inverse_transform(np.array(yhat_scaled).reshape(-1, 1)).ravel()
 
-    # Excel татах (метрик)
-    with pd.ExcelWriter("model_metrics.xlsx", engine="xlsxwriter") as writer:
-        results_df.to_excel(writer, index=False)
-    with open("model_metrics.xlsx", "rb") as f:
-        st.download_button(
-            "Моделийн метрик Excel татах",
-            data=f,
-            file_name="model_metrics.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+# Ирээдүйн 30 хоногийн хүснэгт
+last_date = model_df.index[-1]
+last_lags_raw = model_df[[f"lag_{i}" for i in range(1, n_lag + 1)]].iloc[-1].values
+future_dates_30 = pd.date_range(start=last_date + pd.Timedelta(days=1), periods=30, freq="D")
+future_preds_df = pd.DataFrame({"date": future_dates_30})
+for name, model in MODEL_LIST:
+    if name in y_preds:
+        future_preds_df[name] = forecast_next_daily(model, last_lags_raw, last_date, steps=30)
 
-    # Ирээдүйн прогноз helper
-    def forecast_next(model, last_values, steps=12):
-        preds = []
-        seq = last_values.copy()
-        for _ in range(steps):
-            pred = model.predict([seq])[0]
-            preds.append(pred)
-            seq = np.roll(seq, -1)
-            seq[-1] = pred
-        return np.array(preds)
+with pd.ExcelWriter("model_predictions_daily.xlsx", engine="xlsxwriter") as writer:
+    test_preds_df.to_excel(writer, index=False, sheet_name="Test_Predictions_Daily")
+    future_preds_df.to_excel(writer, index=False, sheet_name="Future_30D_Predictions")
+with open("model_predictions_daily.xlsx", "rb") as f:
+    st.download_button("Test/Forecast (өдөр) Excel татах", data=f, file_name="model_predictions_daily.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-    forecast_steps = {"30 хоног": 1, "90 хоног": 3, "180 хоног": 6, "365 хоног": 12}
-    model_forecasts = {}
-    last_seq = scaler_X.transform(X[-1].reshape(1, -1)).flatten()
+st.subheader("Test датан дээрх модел бүрийн бодит болон таамагласан (өдөр, толгой 10 мөр):")
+st.dataframe(test_preds_df.head(10), use_container_width=True)
 
-    for name, model in MODEL_LIST:
-        if name not in y_preds:
-            continue
-        preds_dict = {}
-        for k, s in forecast_steps.items():
-            scaled_preds = forecast_next(model, last_seq, steps=s)
-            inv_preds = scaler_y.inverse_transform(scaled_preds.reshape(-1, 1)).flatten()
-            preds_dict[k] = inv_preds
-        model_forecasts[name] = preds_dict
+st.subheader("Хоризонт сонгож графикаар харах:")
+forecast_steps = {"7 хоног": 7, "14 хоног": 14, "30 хоног": 30, "90 хоног": 90,"180 хоног": 180,"365 хоног": 365}
+selected_model = st.selectbox("Модель сонгох:", list(y_preds.keys()))
+selected_h = st.selectbox("Хоризонт:", list(forecast_steps.keys()), index=2)
+steps = forecast_steps[selected_h]
+plot_future = forecast_next_daily(dict(MODEL_LIST)[selected_model], last_lags_raw, last_date, steps)
+plot_dates = pd.date_range(start=last_date + pd.Timedelta(days=1), periods=steps, freq="D")
+future_df = pd.DataFrame({"date": plot_dates, "forecast": plot_future})
+fig = px.line(future_df, x="date", y="forecast", markers=True, title=f"{selected_model} — ирэх {steps} хоногийн прогноз (өдөр)")
+st.plotly_chart(fig, use_container_width=True)
 
-    # Test дээрх бодит/таамаг
-    test_dates = grouped["date"].iloc[-len(X_test):].values
-    test_true = scaler_y.inverse_transform(y_test.reshape(-1, 1)).flatten()
-    test_preds_df = pd.DataFrame({"date": test_dates, "real": test_true})
-    for name in model_forecasts.keys():
-        ypi = scaler_y.inverse_transform(np.array(y_preds[name]).reshape(-1, 1)).flatten()
-        test_preds_df[name] = ypi
-
-    # Ирээдүйн 12 сарын таамаг (модел бүрээр)
-    future_dates = pd.date_range(start=grouped["date"].iloc[-1] + pd.offsets.MonthBegin(), periods=12, freq="MS")
-    future_preds_df = pd.DataFrame({"date": future_dates})
-    for name, model in MODEL_LIST:
-        if name not in y_preds:
-            continue
-        scaled_preds = forecast_next(model, last_seq, steps=12)
-        inv_preds = scaler_y.inverse_transform(scaled_preds.reshape(-1, 1)).flatten()
-        future_preds_df[name] = inv_preds
-
-    with pd.ExcelWriter("model_predictions.xlsx", engine="xlsxwriter") as writer:
-        test_preds_df.to_excel(writer, index=False, sheet_name="Test_Predictions")
-        future_preds_df.to_excel(writer, index=False, sheet_name="Future_Predictions")
-    with open("model_predictions.xlsx", "rb") as f:
-        st.download_button(
-            "Test/Forecast бүх моделийн таамаглалуудыг Excel-р татах",
-            data=f,
-            file_name="model_predictions.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-
-    st.subheader("Test датан дээрх модел бүрийн бодит болон таамагласан утгууд (толгой 10 мөр):")
-    st.dataframe(test_preds_df.head(10), use_container_width=True)
-
-    st.subheader("Ирээдүйн 12 сарын прогноз (модел бүрээр):")
-    st.dataframe(future_preds_df, use_container_width=True)
-
-    st.subheader("1 жилийн прогноз график (модел сонгоод харна):")
-    selected_model = st.selectbox("Модель сонгох:", list(model_forecasts.keys()))
-    future = model_forecasts[selected_model]["365 хоног"]
-    dates_future = pd.date_range(start=grouped["date"].iloc[-1] + pd.offsets.MonthBegin(), periods=12, freq="MS")
-    future_df = pd.DataFrame({"date": dates_future, "forecast": future})
-    fig = px.line(future_df, x="date", y="forecast", markers=True, title=f"{selected_model}-ийн ирэх 12 сарын прогноз")
-    st.plotly_chart(fig, use_container_width=True)
 
 # -------------------------- Hotspot (DBSCAN) --------------------------
 
@@ -532,34 +491,18 @@ else:
     st.warning("Сонгох хувьсагчидыг оруулна уу!")
 
 # -------------------------- 2. Ослын өсөлтийн тренд --------------------------
-
 st.header("2. Ослын өсөлтийн тренд")
-st.subheader("Жил, сар бүрээр ослын тооны тренд")
+mode_trend = st.radio("Дэлгэцлэх огнооны нягтрал:", ["Өдөр", "Сар"], index=0, horizontal=True)
 
-trend_data = (
-    df[df["Осол"] == 1]
-    .groupby(["Year", "Month"])
-    .agg(osol_count=("Осол", "sum"))
-    .reset_index()
-)
-trend_data["YearMonth"] = trend_data.apply(lambda x: f"{int(x['Year'])}-{int(x['Month']):02d}", axis=1)
-
-available_years = sorted(trend_data["Year"].unique())
-year_options = ["Бүгд"] + [str(y) for y in available_years]
-selected_year = st.selectbox("Жил сонгох:", year_options)
-
-plot_df = trend_data if selected_year == "Бүгд" else trend_data[trend_data["Year"] == int(selected_year)].copy()
-fig = px.line(plot_df, x="YearMonth", y="osol_count", markers=True, labels={"YearMonth": "Он-Сар", "osol_count": "Ослын тоо"}, title="")
-fig.update_layout(
-    xaxis_tickangle=45,
-    hovermode="x unified",
-    plot_bgcolor="white",
-    yaxis=dict(title="Ослын тоо", rangemode="tozero"),
-    xaxis=dict(title="Он-Сар"),
-)
-fig.update_traces(line=dict(width=3))
-st.write("Доорх графикт ослын тооны өөрчлөлтийг харуулав.")
+if mode_trend == "Өдөр":
+    daily_tr = df[df["Осол"] == 1].groupby("Date").agg(osol_count=("Осол", "sum")).reset_index()
+    fig = px.line(daily_tr, x="Date", y="osol_count", markers=True, labels={"Date":"Огноо","osol_count":"Ослын тоо"})
+else:
+    monthly_tr = df[df["Осол"] == 1].groupby(["Year","Month"]).agg(osol_count=("Осол","sum")).reset_index()
+    monthly_tr["YearMonth"] = monthly_tr.apply(lambda x: f"{int(x['Year'])}-{int(x['Month']):02d}", axis=1)
+    fig = px.line(monthly_tr, x="YearMonth", y="osol_count", markers=True, labels={"YearMonth":"Он-Сар","osol_count":"Ослын тоо"})
 st.plotly_chart(fig, use_container_width=True)
+
 
 # -------------------------- 4. Категори хамаарал (Cramér’s V + Chi-square) --------------------------
 
