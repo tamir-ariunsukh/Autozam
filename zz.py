@@ -59,6 +59,15 @@ from scipy.stats import chi2_contingency
 import folium
 from streamlit_folium import st_folium
 
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense
+
+def build_lstm_model(input_shape, units=64):
+    model = Sequential()
+    model.add(LSTM(units, activation="tanh", input_shape=input_shape))
+    model.add(Dense(1))
+    model.compile(optimizer="adam", loss="mse")
+    return model
 # -------------------------- UI setup --------------------------
 st.set_page_config(page_title="Осол — Auto ML & Hotspot (auto-binary)", layout="wide")
 
@@ -83,32 +92,6 @@ def is_binary_series(s: pd.Series) -> bool:
     if len(vals) == 0:
         return False
     return set(np.unique(vals)).issubset({0, 1})
-
-def clean_road_width(width):
-    """'Авто зам - Зорчих хэсгийн өргөн' талбарын текстэн утгуудыг тоон болгох."""
-    if pd.isna(width):
-        return np.nan
-    if isinstance(width, (int, float)):
-        return float(width)
-    if isinstance(width, str):
-        w = (
-            width.replace("м", "")
-            .replace("-ээс дээш", "")
-            .replace("хүртэл", "")
-            .replace(",", ".")
-            .strip()
-        )
-        if "-" in w:
-            try:
-                low, high = map(float, w.split("-"))
-                return (low + high) / 2
-            except Exception:
-                return np.nan
-        try:
-            return float(w)
-        except Exception:
-            return np.nan
-    return np.nan
 
 def plot_correlation_matrix(df, title, columns):
     n_unique = df[columns].nunique()
@@ -143,7 +126,7 @@ def load_data(file=None, default_path: str = "кодлогдсон.xlsx"):
     if file is not None:
         df = pd.read_excel(file)
     else:
-        local = Path("/mnt/data/кодлогдсон - Copy.xlsx")
+        local = Path("кодлогдсон.xlsx")
         if local.exists():
             df = pd.read_excel(local)
         else:
@@ -173,9 +156,7 @@ def load_data(file=None, default_path: str = "кодлогдсон.xlsx"):
     if len(years) > 0:
         df["Зөрчил огноо жил (min-max)"] = df["Year"].between(min(years), max(years)).astype(int)
 
-    # Замын өргөн цэвэрлэх (байвал)
-    if "Авто зам - Зорчих хэсгийн өргөн" in df.columns:
-        df["Авто зам - Зорчих хэсгийн өргөн"] = df["Авто зам - Зорчих хэсгийн өргөн"].apply(clean_road_width)
+
 
     # Координат нэршил
     lat_col = resolve_col(df, ["Өргөрөг", "lat", "latitude"])
@@ -207,13 +188,9 @@ def load_data(file=None, default_path: str = "кодлогдсон.xlsx"):
     }
     return df, meta
 
-# 3. Ашиглах
-df, meta = load_data(uploaded_file)
-
-
 # -------------------------- Ачаалж эхлэх --------------------------
 
-df, meta = load_data()
+df, meta = load_data(uploaded_file)
 lat_col, lon_col = meta["lat_col"], meta["lon_col"]
 binary_cols = meta["binary_cols"]
 num_additional = meta["numeric_candidates"]
@@ -257,13 +234,12 @@ X_all = df[feature_pool].fillna(0.0).values
 
 # Top features via RandomForest
 # Top features via RandomForest + SHAP
-import shap
-
+# Top features via RandomForest + SHAP
 try:
+    import shap
     rf_global = RandomForestRegressor(n_estimators=300, random_state=42)
     rf_global.fit(X_all, y_all)
 
-    # Importance (classic Gini importance)
     importances = rf_global.feature_importances_
     indices = np.argsort(importances)[::-1]
     top_k = min(14, len(feature_pool))
@@ -272,16 +248,14 @@ try:
     st.caption("RandomForest-аар сонгосон нөлөө ихтэй шинжүүд (top importance):")
     st.write(top_features)
 
-    # === SHAP values ===
+    # SHAP plot
     explainer = shap.TreeExplainer(rf_global)
     shap_values = explainer.shap_values(X_all)
-
     st.subheader("🔎 SHAP value шинжилгээ (global importance)")
     shap.summary_plot(shap_values, X_all, feature_names=feature_pool, plot_type="bar", show=False)
+    st.pyplot(plt.gcf())  # ← жинхэнэ SHAP графикийг харуулна
 
-    fig, ax = plt.subplots()
-    ax.plot([1, 2, 3], [1, 4, 9])
-    st.pyplot(fig)   # fig-ийг дамжуулж байна
+
     # Rare feature filter
     rare_threshold = 0.01  # <1% мөрөнд л 1 гэсэн утгатай бол 'rare'
     rare_features = []
@@ -360,13 +334,18 @@ else:
         ("MLPRegressor", MLPRegressor(hidden_layer_sizes=(64, 32), max_iter=800, random_state=42)),
         ("ElasticNet", ElasticNet()),
         ("Stacking", StackingRegressor(estimators=estimators, final_estimator=LinearRegression(), cv=5)),
+        ("LSTM", build_lstm_model)
     ]
     if XGBRegressor is not None:
-        MODEL_LIST.append(("XGBRegressor", XGBRegressor(tree_method="gpu_hist", predictor="gpu_predictor", random_state=42)))
+        MODEL_LIST.append(("XGBRegressor",
+            XGBRegressor(tree_method="hist", predictor="cpu_predictor", random_state=42)))
     if CatBoostRegressor is not None:
-        MODEL_LIST.append(("CatBoostRegressor", CatBoostRegressor(task_type="GPU", devices="0", random_state=42, verbose=0)))
+        MODEL_LIST.append(("CatBoostRegressor",
+            CatBoostRegressor(task_type="CPU", random_state=42, verbose=0)))
     if LGBMRegressor is not None:
-        MODEL_LIST.append(("LGBMRegressor", LGBMRegressor(device="gpu", gpu_platform_id=0, gpu_device_id=0, random_state=42)))
+        MODEL_LIST.append(("LGBMRegressor",
+            LGBMRegressor(device="cpu", random_state=42)))
+
 
     # ====================================================
     # 🆕 VotingRegressor + StackingEnsemble нэмсэн хэсэг
@@ -375,11 +354,11 @@ else:
 
     voting_estimators = []
     if XGBRegressor is not None:
-        voting_estimators.append(("xgb", XGBRegressor(tree_method="gpu_hist", predictor="gpu_predictor", random_state=42)))
+        voting_estimators.append(("xgb", XGBRegressor(tree_method="hist", predictor="cpu_predictor", random_state=42)))
     if LGBMRegressor is not None:
-        voting_estimators.append(("lgbm", LGBMRegressor(device="gpu", gpu_platform_id=0, gpu_device_id=0, random_state=42)))
+        voting_estimators.append(("lgbm", LGBMRegressor(device="cpu", random_state=42)))
     if CatBoostRegressor is not None:
-        voting_estimators.append(("cat", CatBoostRegressor(task_type="GPU", devices="0", random_state=42, verbose=0)))
+        voting_estimators.append(("cat", CatBoostRegressor(task_type="CPU", random_state=42, verbose=0)))
     voting_estimators.append(("rf", RandomForestRegressor(n_estimators=200, random_state=42)))
     voting_estimators.append(("gb", GradientBoostingRegressor(random_state=42)))
 
@@ -388,11 +367,12 @@ else:
 
     stacking_estimators = [("rf", RandomForestRegressor(random_state=42))]
     if XGBRegressor is not None:
-        stacking_estimators.append(("xgb", XGBRegressor(random_state=42)))
+        stacking_estimators.append(("xgb", XGBRegressor(tree_method="hist", predictor="cpu_predictor", random_state=42)))
     if LGBMRegressor is not None:
-        stacking_estimators.append(("lgbm", LGBMRegressor(random_state=42)))
+        stacking_estimators.append(("lgbm", LGBMRegressor(device="cpu", random_state=42)))
     if CatBoostRegressor is not None:
-        stacking_estimators.append(("cat", CatBoostRegressor(verbose=0, random_state=42)))
+        stacking_estimators.append(("cat", CatBoostRegressor(task_type="CPU", verbose=0, random_state=42)))
+
 
     MODEL_LIST.append((
         "StackingEnsemble",
@@ -447,18 +427,40 @@ else:
             seq = np.roll(seq, -1)
             seq[-1] = pred
         return np.array(preds)
+    
+    def forecast_next_daily(model, last_values, steps=30):
+        preds = []
+        seq = np.array(last_values).reshape(1, -1)  # ML model оролт зөв хэлбэртэй болгоно
+        for _ in range(steps):
+            pred = model.predict(seq)[0]
+            preds.append(pred)
+            seq = np.roll(seq, -1, axis=1)
+            seq[0, -1] = pred
+        return np.array(preds)
+    def forecast_next_daily_lstm(model, last_values, steps=30, window=12):
+        preds = []
+        seq = np.array(last_values[-window:]).reshape(1, window, 1)
+        for _ in range(steps):
+            pred = model.predict(seq, verbose=0)[0][0]
+            preds.append(pred)
+            # дараагийн алхамд input-г update хийнэ
+            seq = np.roll(seq, -1, axis=1)
+            seq[0, -1, 0] = pred
+        return np.array(preds)
 
-    forecast_steps = {"30 хоног": 1, "90 хоног": 3, "180 хоног": 6, "365 хоног": 12}
     model_forecasts = {}
     # 🛠 Алдааг зассан: X_scaled биш X_test ашиглав
     last_seq = X_test[-1]
-
+    forecast_steps = {"7 хоног": 7, "14 хоног": 14, "30 хоног": 30, "90 хоног": 90, "180 хоног": 180, "365 хоног": 365}
     for name, model in MODEL_LIST:
         if name not in y_preds:
             continue
         preds_dict = {}
         for k, s in forecast_steps.items():
-            scaled_preds = forecast_next(model, last_seq, steps=s)
+            if name == "LSTM":
+                scaled_preds = forecast_next_daily_lstm(model, last_seq, steps=s, window=n_lag)
+            else:
+                scaled_preds = forecast_next(model, last_seq, steps=s)
             inv_preds = scaler_y.inverse_transform(scaled_preds.reshape(-1, 1)).flatten()
             preds_dict[k] = inv_preds
         model_forecasts[name] = preds_dict
@@ -499,7 +501,7 @@ else:
     st.dataframe(future_preds_df, use_container_width=True)
 
     st.subheader("Хоризонт сонгож графикаар харах:")
-forecast_steps = {"7 хоног": 7, "14 хоног": 14, "30 хоног": 30, "90 хоног": 90, "180 хоног": 180, "365 хоног": 365}
+
 
 # Модель сонголт (өдөрийн pipeline ажиллаж байгаа эсэхээс шалтгаалан)
 model_options = list(y_preds.keys()) if 'y_preds' in locals() and len(y_preds) > 0 else list(model_forecasts.keys())
@@ -508,24 +510,29 @@ selected_h = st.selectbox("Хоризонт:", list(forecast_steps.keys()), inde
 
 # Огнооны нягтрал шилжлүүлт
 gran = st.radio("Дэлгэцлэх огнооны нягтрал №1:", ["Өдөр", "Сар"], index=0, horizontal=True)
+last_date = grouped["date"].iloc[-1]
+last_seq = X_test[-1]
+
+last_lags_raw = grouped[feature_cols].iloc[-1].values
 
 steps = forecast_steps[selected_h]
-if 'forecast_next_daily' in globals() and 'last_lags_raw' in globals():
+if 'forecast_next_daily' in globals():
     # Өдөр тутмын таамаглалтай горим
-    plot_future = forecast_next_daily(dict(MODEL_LIST)[selected_model], last_lags_raw, last_date, steps)
+    plot_future = forecast_next_daily(dict(MODEL_LIST)[selected_model], last_seq, steps)
     plot_dates = pd.date_range(start=last_date + pd.Timedelta(days=1), periods=steps, freq="D")
     future_df = pd.DataFrame({"date": plot_dates, "forecast": plot_future})
     if gran == "Сар":
         future_df = future_df.set_index("date").resample("MS").sum().reset_index()
     title = f"{selected_model} — ирэх {steps} хоногийн прогноз ({'өдөр' if gran=='Өдөр' else 'сар'})"
 else:
-    # Сарын fallback горим (өдөрийн pipeline байхгүй үед)
+    # Сарын fallback горим
     preds = model_forecasts[selected_model].get(selected_h)
     months = len(preds) if preds is not None else 0
     dates_future = pd.date_range(start=grouped["date"].iloc[-1] + pd.offsets.MonthBegin(), periods=months, freq="MS")
     future_df = pd.DataFrame({"date": dates_future, "forecast": preds})
     gran = "Сар"
     title = f"{selected_model} — {selected_h} прогноз (сар)"
+
 
 fig = px.line(future_df, x="date", y="forecast", markers=True, title=title)
 st.plotly_chart(fig, use_container_width=True)
@@ -729,7 +736,7 @@ def empirical_bayes(obs, exp, prior_mean, prior_var):
     return weight * obs + (1 - weight) * prior_mean
 
 # -------------------------- Байршлын баганыг таних --------------------------
-loc_col = resolve_col(df, ["Замын байршил", "Байршил", "location", "Road Location"])
+loc_col = resolve_col(df, ["Замын байршил ", "Байршил", "location", "Road Location"])
 if loc_col is None:
     st.error("⚠️ Замын байршлын багана олдсонгүй. Excel дээр 'Замын байршил' гэх мэт багана байгаа эсэхийг шалгана уу.")
     st.stop()
@@ -860,19 +867,19 @@ st.markdown(
 
 
 # ============================================================
-# 9. Координат удамшуулах (2024 → 2020–2023) + DBSCAN шинжилгээ
-# ============================================================
-# ============================================================
 # 9. Координат удамшуулах (2024 → 2020–2023) + DBSCAN шинжилгээ + Газрын зураг
 # ============================================================
 
 st.header("9. Удамшсан координат дээр DBSCAN кластерчилал")
 
 # --- шаардлагатай баганууд ---
-req_cols = ["Замын код", "Аймаг-Дүүрэг", "Хороо-Сум", "Зөрчил гарсан газрын хаяг", "Замын байршил"]
+req_cols = ["Замын код", "Аймаг-Дүүрэг", "Хороо-Сум", "Зөрчил гарсан газрын хаяг", "Замын байршил "]
 missing_cols = [c for c in req_cols if c not in df.columns]
-if missing_cols:
-    st.error(f"Дараах баганууд датанд алга байна: {missing_cols}")
+
+
+
+if not (lat_col and lon_col):
+    st.info("Координатын баганууд олдсонгүй (Өргөрөг/Уртраг эсвэл lat/lon). Энэ хэсгийг алгаслаа.")
 else:
     # --- 9.1 Reference (2024 он) бэлтгэх ---
     df_2024 = df[df["Year"] == 2024].copy()
@@ -881,7 +888,7 @@ else:
         df_2024["Аймаг-Дүүрэг"].astype(str) + "_" +
         df_2024["Хороо-Сум"].astype(str) + "_" +
         df_2024["Зөрчил гарсан газрын хаяг"].astype(str) + "_" +
-        df_2024["Замын байршил"].astype(str)
+        df_2024["Замын байршил "].astype(str)
     )
     df_2024_grouped = (
         df_2024.groupby("ref_key")[[lat_col, lon_col]]
@@ -891,7 +898,11 @@ else:
     ref_dict = df_2024_grouped.set_index("ref_key")[[lat_col, lon_col]].to_dict("index")
 
     # --- 9.2 Координат удамшуулах функц ---
-    from haversine import haversine
+    try:
+        from haversine import haversine
+    except Exception:
+        haversine = None
+
     def inherit_coords(row, threshold_m=500):
         if row["Year"] == 2024:
             return row[lat_col], row[lon_col]
@@ -900,14 +911,19 @@ else:
             str(row["Аймаг-Дүүрэг"]) + "_" +
             str(row["Хороо-Сум"]) + "_" +
             str(row["Зөрчил гарсан газрын хаяг"]) + "_" +
-            str(row["Замын байршил"])
+            str(row["Замын байршил "])
         )
+
+
         if key in ref_dict:
             ref_lat = ref_dict[key][lat_col]
             ref_lon = ref_dict[key][lon_col]
-            try:
-                dist = haversine((ref_lat, ref_lon), (row[lat_col], row[lon_col])) * 1000
-            except:
+            if haversine is not None and pd.notna(row[lat_col]) and pd.notna(row[lon_col]):
+                try:
+                    dist = haversine((ref_lat, ref_lon), (row[lat_col], row[lon_col])) * 1000
+                except:
+                    dist = np.inf
+            else:
                 dist = np.inf
             if (41 <= row[lat_col] <= 52) and (87 <= row[lon_col] <= 120):
                 return (row[lat_col], row[lon_col]) if dist <= threshold_m else (ref_lat, ref_lon)
@@ -922,7 +938,8 @@ else:
     # --- 9.3 DBSCAN кластерчилал ---
     coords = df[[lat_col, lon_col]].to_numpy()
     if len(coords) > 5:
-        db = DBSCAN(eps=0.001, min_samples=5, metric="haversine")
+        eps_val = st.sidebar.slider("DBSCAN eps (радиан)", 0.001, 0.02, 0.005, step=0.001)
+        db = DBSCAN(eps=eps_val, min_samples=5, metric="haversine")
         df["cluster_inherited"] = db.fit_predict(np.radians(coords))
     else:
         df["cluster_inherited"] = -1
@@ -949,26 +966,40 @@ else:
             else:
                 trend = "тогтвортой"
         trend_list.append({"cluster": cl, "trend": trend, "тоо": counts.sum()})
-    df_trend = pd.DataFrame(trend_list).sort_values("тоо", ascending=False)
+
+    if trend_list:
+        df_trend = pd.DataFrame(trend_list).sort_values("тоо", ascending=False)
+        st.subheader("Кластерийн трендүүд (2020–2024)")
+        st.dataframe(df_trend, use_container_width=True)
+    else:
+        st.warning("⚠️ DBSCAN-аар кластер тодорхойлогдсонгүй (бүгд -1 болсон байж магадгүй). eps/min_samples тохиргоог шалгана уу.")
+        df_trend = pd.DataFrame()
+
 
     st.subheader("Кластерийн трендүүд (2020–2024)")
     st.dataframe(df_trend, use_container_width=True)
 
     # --- 9.5 Binary хувьсагчийн ач холбогдол ---
     from sklearn.ensemble import RandomForestClassifier
-    if binary_cols:
+
+    if binary_cols and len(df) > 0 and df["cluster_inherited"].nunique() > 1:
         X = df[binary_cols]
         y = df["cluster_inherited"].astype(str)
-        rf = RandomForestClassifier(n_estimators=200, random_state=42)
-        rf.fit(X, y)
-        feature_imp = pd.DataFrame({
-            "feature": binary_cols,
-            "importance": rf.feature_importances_
-        }).sort_values("importance", ascending=False)
-        st.subheader("Binary хувьсагчийн ач холбогдол (RandomForest importance)")
-        st.dataframe(feature_imp, use_container_width=True)
+
+        if len(X) > 0:
+            rf = RandomForestClassifier(n_estimators=200, random_state=42)
+            rf.fit(X, y)
+            feature_imp = pd.DataFrame({
+                "feature": binary_cols,
+                "importance": rf.feature_importances_
+            }).sort_values("importance", ascending=False)
+            st.subheader("Binary хувьсагчийн ач холбогдол (RandomForest importance)")
+            st.dataframe(feature_imp, use_container_width=True)
+        else:
+            st.info("⚠️ Кластер болон binary хувьсагчид огтлолцох мөр олдсонгүй.")
     else:
-        st.info("Binary (0/1) багана олдсонгүй, importance тооцоогүй.")
+        st.info("⚠️ Binary (0/1) багана эсвэл кластерийн өгөгдөл байхгүй тул importance тооцоогүй.")
+
 
     # --- 9.6 Газрын зураг дээр дүрслэх ---
     import folium
@@ -993,7 +1024,7 @@ else:
                 f"Замын код: {row['Замын код']}<br>"
                 f"Аймаг-Дүүрэг: {str(row['Аймаг-Дүүрэг'])}<br>"
                 f"Хороо-Сум: {str(row['Хороо-Сум'])}<br>"
-                f"Байршил: {str(row['Замын байршил'])}<br>"
+                f"Байршил: {str(row['Замын байршил '])}<br>"
                 f"Кластер: {cl}<br>"
                 f"Тренд: {trend_dict.get(cl, 'N/A')}"
             )
