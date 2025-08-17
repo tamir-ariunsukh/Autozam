@@ -1,14 +1,13 @@
 # -*- coding: utf-8 -*-
 # ============================================================
 # Зам тээврийн осол — Auto ML & Hotspot Dashboard (Streamlit)
-# Хувилбар: 2025-08-17b — Leakage-free scaling, 200-row quick sample, bias-corrected Cramér's V
+# Хувилбар: 2025-08-17 — Binary autodetect + robust column resolver + target UI
 # Тайлбар:
 #  - Хавсаргасан Excel ("кодлогдсон - Copy.xlsx")-тай шууд зохицно.
 #  - Binary (0/1) бүх баганыг автоматаар илрүүлж, модел/корреляц/хотспотод ашиглана.
 #  - Координат баганууд (Өргөрөг/Уртраг эсвэл lat/lon) байвал газрын зураг зурна.
 #  - Олон ML модел сургалт, метрик/таамаглалыг Excel болгон татах боломжтой.
 #  - "Осол" багана байхгүй тохиолдолд "Төрөл"-өөс (Гэмт хэрэг/Зөрчлийн хэрэг) зорилтыг үүсгэнэ.
-#  - Шинэчлэлтүүд: (i) scaler-ийг train-д л fit хийж data leakage арилгав, (ii) 200 мөрийн хурдан ажиллуулах сонголт, (iii) Cramér's V-ийн bias-corrected хувилбар нэмэв.
 # Гүйцэтгэх: streamlit run osol_auto_streamlit.py
 # ============================================================
 
@@ -24,6 +23,8 @@ import plotly.express as px
 from pathlib import Path
 
 from sklearn.linear_model import LinearRegression, Ridge, Lasso, ElasticNet
+
+
 from sklearn.ensemble import (
     RandomForestRegressor,
     GradientBoostingRegressor,
@@ -60,7 +61,8 @@ from streamlit_folium import st_folium
 
 # -------------------------- UI setup --------------------------
 st.set_page_config(page_title="Осол — Auto ML & Hotspot (auto-binary)", layout="wide")
-st.title("Зам тээврийн ослын анализ — Auto (Binary autodetect)")
+
+st.title=("С.Цолмон, А.Тамир нарын хар цэгийн судалгаа 2025-08-18")
 
 # -------------------------- Туслах функцууд --------------------------
 
@@ -116,7 +118,7 @@ def plot_correlation_matrix(df, title, columns):
     for col in df_encoded.columns:
         if df_encoded[col].dtype == "object":
             df_encoded[col] = pd.Categorical(df_encoded[col]).codes
-    corr_matrix = df_encoded.corr(numeric_only=True)
+    corr_matrix = df_encoded.corr()
     corr_matrix = corr_matrix.iloc[::-1]
     fig, ax = plt.subplots(figsize=(max(8, 1.5*len(columns)), max(6, 1.2*len(columns))))
     sns.heatmap(corr_matrix, annot=True, cmap="coolwarm", vmin=-1, vmax=1, center=0, ax=ax, fmt=".3f")
@@ -124,32 +126,22 @@ def plot_correlation_matrix(df, title, columns):
     plt.tight_layout()
     return fig
 
-# Bias-corrected Cramér's V (Bergsma, 2013)
-
-def cramers_v_bias_corrected(table: pd.DataFrame) -> float:
-    chi2, _, _, _ = chi2_contingency(table)
-    n = table.values.sum()
-    phi2 = chi2 / max(n, 1)
-    r, k = table.shape
-    phi2_corr = max(0, phi2 - (k-1)*(r-1)/(max(n-1, 1)))
-    r_corr = r - (r-1)**2 / max(n-1, 1)
-    k_corr = k - (k-1)**2 / max(n-1, 1)
-    denom = max(min(k_corr-1, r_corr-1), 1e-12)
-    return float(np.sqrt(phi2_corr / denom))
-
 # -------------------------- Өгөгдөл ачаалалт --------------------------
+from pathlib import Path
+import pandas as pd
+import streamlit as st
 
+# 1. Энд widget-ээ гадна гаргаж өгнө
+uploaded_file = st.sidebar.file_uploader("Excel файл оруулах (.xlsx)", type=["xlsx"])
+
+# 2. Кэштэй зөвхөн дата унших функц
 @st.cache_data(show_spinner=True)
-def load_data(default_path: str = "кодлогдсон - Copy.xlsx"):
+def load_data(file=None, default_path: str = "кодлогдсон.xlsx"):
     """
-    - Sidebar дээрээс .xlsx файлаар upload хийж болно.
-    - Хэрэв оруулаагүй бол default_path-ыг уншина.
-    - Огнооны баганыг robust байдлаар олно, 'Зөрчил огноо' үүсгэнэ.
-    - Координат ба binary багануудыг автоматаар илрүүлнэ.
+    Excel дата унших функц (widget дотор биш).
     """
-    up = st.sidebar.file_uploader("Excel файл оруулах (.xlsx)", type=["xlsx"])
-    if up is not None:
-        df = pd.read_excel(up)
+    if file is not None:
+        df = pd.read_excel(file)
     else:
         local = Path("/mnt/data/кодлогдсон - Copy.xlsx")
         if local.exists():
@@ -160,8 +152,9 @@ def load_data(default_path: str = "кодлогдсон - Copy.xlsx"):
     # Нэршил цэвэрлэгээ
     df.columns = [c.strip() if isinstance(c, str) else c for c in df.columns]
 
-    # Огноо баганыг robust байдлаар олох
-    recv_col = resolve_col(df, ["Хүлээн авсан", "Хүлээн авсан ", "Огноо", "Зөрчил огноо", "Осол огноо", "Ослын огноо", "Date"]) 
+    # Огноо багана хайх
+    recv_col = resolve_col(df, ["Хүлээн авсан", "Хүлээн авсан ", "Огноо", "Зөрчил огноо", 
+                                "Осол огноо", "Ослын огноо", "Date"]) 
     if recv_col is None:
         st.error("Огнооны багана олдсонгүй. Жишээ нь: 'Хүлээн авсан'.")
         st.stop()
@@ -171,7 +164,7 @@ def load_data(default_path: str = "кодлогдсон - Copy.xlsx"):
     df["Year"]  = df["Зөрчил огноо"].dt.year
     df["Month"] = df["Зөрчил огноо"].dt.month
     df["Day"]   = df["Зөрчил огноо"].dt.day_name()
-    df["Date"] = df["Зөрчил огноо"].dt.normalize()
+
 
     # Он жилүүдийн one-hot
     years = sorted(df["Year"].dropna().unique().tolist())
@@ -205,8 +198,18 @@ def load_data(default_path: str = "кодлогдсон - Copy.xlsx"):
     if "Аймаг" not in df.columns:
         df["Аймаг"] = 0
 
-    meta = {"lat_col": lat_col, "lon_col": lon_col, "binary_cols": binary_cols, "numeric_candidates": numeric_candidates, "years": years}
+    meta = {
+        "lat_col": lat_col,
+        "lon_col": lon_col,
+        "binary_cols": binary_cols,
+        "numeric_candidates": numeric_candidates,
+        "years": years
+    }
     return df, meta
+
+# 3. Ашиглах
+df, meta = load_data(uploaded_file)
+
 
 # -------------------------- Ачаалж эхлэх --------------------------
 
@@ -215,14 +218,6 @@ lat_col, lon_col = meta["lat_col"], meta["lon_col"]
 binary_cols = meta["binary_cols"]
 num_additional = meta["numeric_candidates"]
 years = meta["years"]
-
-# -------------------------- Sidebar: Sampling & Seed --------------------------
-
-st.sidebar.markdown("### ⚙️ Ашиглалтын тохиргоо")
-seed = int(st.sidebar.number_input("Random seed", value=42, step=1))
-quick_sample = st.sidebar.checkbox("⚡ 200 мөрөөр хурдан ажиллуулах (санамсаргүй)", value=False)
-if quick_sample and len(df) > 200:
-    df = df.sample(n=200, random_state=seed).sort_values("Зөрчил огноо")
 
 # -------------------------- Target тохиргоо --------------------------
 
@@ -246,215 +241,294 @@ else:  # Зөвхөн Зөрчлийн хэрэг
     df["Осол"] = (df[torol_col] == "Зөрчлийн хэрэг").astype(int)
 
 # -------------------------- 5. Ирээдүйн ослын таамаглал --------------------------
-# -------------------------- 5. Ирээдүйн ослын ТАМАГЛАЛ — ӨДӨР БҮР --------------------------
 
-st.header("5. Ирээдүйн ослын ТАМАГЛАЛ — ӨДӨР БҮР")
-st.caption("Загвар нь зөвхөн лагууд (өмнөх өдрүүдийн ослын тоо) + календарын шинжүүдийг (7 хоногийн өдөр) ашиглана.")
+st.header("5. Ирээдүйн ослын таамаглал (Олон ML/DL загвар)")
+st.caption("Binary (0/1) багануудыг автоматаар илрүүлж, загварт ашигласан.")
 
-# Өдөр бүрийн цуваа
-series_day = (
-    df[df["Осол"] == 1]
-    .groupby("Date")["Осол"].sum()
-)
-if series_day.empty:
-    st.error("Өдөр бүрийн ослын тоо үүсгэхэд өгөгдөл алга.")
+# Feature pool: 'Осол'-оос бусад binary + нэмэлт тоон
+feature_pool = [c for c in (binary_cols + num_additional) if c != "Осол"]
+if len(feature_pool) == 0:
+    st.error("Binary (0/1) хэлбэрийн багана олдсонгүй. Excel-ээ шалгана уу.")
     st.stop()
 
-full_dates = pd.date_range(series_day.index.min(), series_day.index.max(), freq="D")
-day_df = pd.DataFrame(index=full_dates)
-day_df["osol_count"] = series_day.reindex(full_dates, fill_value=0).astype(float)
+# Target/Features
+y_all = pd.to_numeric(df["Осол"], errors="coerce").fillna(0).values
+X_all = df[feature_pool].fillna(0.0).values
 
-# Лагууд (өдөр)
-n_lag = st.sidebar.slider("Өдөрийн лаг цонх (n_lag)", min_value=7, max_value=90, value=30, step=1)
+# Top features via RandomForest
+# Top features via RandomForest + SHAP
+import shap
+
+try:
+    rf_global = RandomForestRegressor(n_estimators=300, random_state=42)
+    rf_global.fit(X_all, y_all)
+
+    # Importance (classic Gini importance)
+    importances = rf_global.feature_importances_
+    indices = np.argsort(importances)[::-1]
+    top_k = min(14, len(feature_pool))
+    top_features = [feature_pool[i] for i in indices[:top_k]]
+
+    st.caption("RandomForest-аар сонгосон нөлөө ихтэй шинжүүд (top importance):")
+    st.write(top_features)
+
+    # === SHAP values ===
+    explainer = shap.TreeExplainer(rf_global)
+    shap_values = explainer.shap_values(X_all)
+
+    st.subheader("🔎 SHAP value шинжилгээ (global importance)")
+    shap.summary_plot(shap_values, X_all, feature_names=feature_pool, plot_type="bar", show=False)
+
+    fig, ax = plt.subplots()
+    ax.plot([1, 2, 3], [1, 4, 9])
+    st.pyplot(fig)   # fig-ийг дамжуулж байна
+    # Rare feature filter
+    rare_threshold = 0.01  # <1% мөрөнд л 1 гэсэн утгатай бол 'rare'
+    rare_features = []
+    for col in feature_pool:
+        freq = df[col].mean() if col in df else 0
+        if freq < rare_threshold:
+            rare_features.append(col)
+
+    if rare_features:
+        st.warning(f"⚠️ Доорх баганууд маш цөөн тохиолдолтой тул importance хэт өндөр гарч магадгүй: {rare_features}")
+
+except Exception as e:
+    st.warning(f"Top features/SHAP тооцоход алдаа гарлаа: {e}")
+    top_features = feature_pool[:min(14, len(feature_pool))]
+
+# Сар бүрийн агрегат (target=Осол==1 давтамж)
+monthly_target = (
+    df[df["Осол"] == 1]
+    .groupby(["Year", "Month"])
+    .agg(osol_count=("Осол", "sum"))
+    .reset_index()
+)
+monthly_target["date"] = pd.to_datetime(monthly_target[["Year", "Month"]].assign(DAY=1))
+monthly_features = df.groupby(["Year", "Month"])[top_features].sum().reset_index()
+
+grouped = pd.merge(monthly_target, monthly_features, on=["Year", "Month"], how="left").sort_values("date").reset_index(drop=True)
+
+# Lag үүсгэх
+n_lag = st.sidebar.slider("Сарны лаг цонх (n_lag)", min_value=6, max_value=18, value=12, step=1)
 for i in range(1, n_lag + 1):
-    day_df[f"lag_{i}"] = day_df["osol_count"].shift(i)
+    grouped[f"osol_lag_{i}"] = grouped["osol_count"].shift(i)
 
-# Календарын шинжүүд (долоо хоногийн өдөр)
-dow = day_df.index.dayofweek
-for j in range(7):
-    day_df[f"dow_{j}"] = (dow == j).astype(int)
+grouped = grouped.dropna().reset_index(drop=True)
 
-model_df = day_df.dropna().copy()
-feature_cols = [f"lag_{i}" for i in range(1, n_lag + 1)] + [f"dow_{j}" for j in range(7)]
-X_all = model_df[feature_cols].values
-y_all = model_df["osol_count"].values.reshape(-1, 1)
-
-# Leakage-free scaling + time-based split
-split_ratio = st.sidebar.slider("Train ratio (өдөр)", 0.5, 0.95, 0.8, 0.05)
-train_size = int(len(X_all) * split_ratio)
-X_train_raw, X_test_raw = X_all[:train_size], X_all[train_size:]
-y_train_raw, y_test_raw = y_all[:train_size], y_all[train_size:]
-
-scaler_X = MinMaxScaler()
-scaler_y = MinMaxScaler()
-X_train = scaler_X.fit_transform(X_train_raw)
-X_test  = scaler_X.transform(X_test_raw)
-y_train = scaler_y.fit_transform(y_train_raw).flatten()
-y_test  = scaler_y.transform(y_test_raw).flatten()
-
-estimators = [
-    ("rf", RandomForestRegressor(n_estimators=120, random_state=seed)),
-    ("ridge", Ridge()),
-    ("dt", DecisionTreeRegressor(random_state=seed)),
-]
-
-MODEL_LIST = [
-    ("LinearRegression", LinearRegression()),
-    ("Ridge", Ridge()),
-    ("Lasso", Lasso()),
-    ("DecisionTree", DecisionTreeRegressor(random_state=seed)),
-    ("RandomForest", RandomForestRegressor(random_state=seed)),
-    ("ExtraTrees", ExtraTreesRegressor(random_state=seed)),
-    ("GradientBoosting", GradientBoostingRegressor(random_state=seed)),
-    ("HistGB", HistGradientBoostingRegressor(random_state=seed)),
-    ("AdaBoost", AdaBoostRegressor(random_state=seed)),
-    ("KNeighbors", KNeighborsRegressor()),
-    ("SVR", SVR()),
-    ("MLPRegressor", MLPRegressor(hidden_layer_sizes=(64, 32), max_iter=800, random_state=seed)),
-    ("ElasticNet", ElasticNet()),
-    ("Stacking", StackingRegressor(estimators=estimators, final_estimator=LinearRegression(), cv=5)),
-]
-if XGBRegressor is not None:
-    MODEL_LIST.append(("XGBRegressor", XGBRegressor(verbosity=0, random_state=seed)))
-if CatBoostRegressor is not None:
-    MODEL_LIST.append(("CatBoostRegressor", CatBoostRegressor(verbose=0, random_state=seed)))
-if LGBMRegressor is not None:
-    MODEL_LIST.append(("LGBMRegressor", LGBMRegressor(random_state=seed)))
-
-progress_bar = st.progress(0, text="ML моделийг сургаж байна...")
-results, y_preds = [], {}
-for i, (name, model) in enumerate(MODEL_LIST):
-    try:
-        model.fit(X_train, y_train)
-        y_pred = model.predict(X_test)
-        y_preds[name] = y_pred
-        mae = mean_absolute_error(y_test, y_pred)
-        rmse = float(np.sqrt(mean_squared_error(y_test, y_pred)))
-        r2 = r2_score(y_test, y_pred)
-        results.append({"Model": name, "MAE": mae, "RMSE": rmse, "R2": r2})
-    except Exception as e:
-        results.append({"Model": name, "MAE": np.nan, "RMSE": np.nan, "R2": np.nan, "Error": str(e)})
-    progress_bar.progress(min(int((i + 1) / len(MODEL_LIST) * 100), 100), text=f"{name} дууслаа")
-progress_bar.empty()
-st.success("Бүх ML модел сургагдлаа!")
-results_df = pd.DataFrame(results).sort_values("RMSE", na_position="last")
-st.dataframe(results_df, use_container_width=True)
-
-with pd.ExcelWriter("model_metrics_daily.xlsx", engine="xlsxwriter") as writer:
-    results_df.to_excel(writer, index=False)
-with open("model_metrics_daily.xlsx", "rb") as f:
-    st.download_button("Моделийн метрик (өдөр) Excel татах", data=f, file_name="model_metrics_daily.xlsx",
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-# --- Ирээдүйн өдөр тутмын прогноз (экзоген календар ашиглана) ---
-def _dow_vec(d: int) -> np.ndarray:
-    v = np.zeros(7); 
-    if 0 <= d <= 6: v[d] = 1
-    return v
-
-def forecast_next_daily(model, last_lags_raw: np.ndarray, last_date: pd.Timestamp, steps: int) -> np.ndarray:
-    seq = last_lags_raw.astype(float).copy()   # [lag_1, ..., lag_n]
-    preds_raw, cur_date = [], last_date
-    for _ in range(steps):
-        next_date = cur_date + pd.Timedelta(days=1)
-        x_raw = np.concatenate([seq, _dow_vec(next_date.dayofweek)])
-        x_scaled = scaler_X.transform(x_raw.reshape(1, -1))
-        yhat_scaled = model.predict(x_scaled)[0]
-        yhat_raw = scaler_y.inverse_transform(np.array([[yhat_scaled]])).ravel()[0]
-        preds_raw.append(yhat_raw)
-        seq = np.concatenate([[yhat_raw], seq[:-1]])  # шинэ лаг_1 = өнөөдрийн таамаг
-        cur_date = next_date
-    return np.array(preds_raw)
-
-# Test дээрх бодит/таамаг
-idx_all = model_df.index
-test_dates = idx_all[-len(X_test):]
-true_test_raw = scaler_y.inverse_transform(y_test.reshape(-1, 1)).ravel()
-test_preds_df = pd.DataFrame({"date": test_dates, "real": true_test_raw})
-for name, yhat_scaled in y_preds.items():
-    test_preds_df[name] = scaler_y.inverse_transform(np.array(yhat_scaled).reshape(-1, 1)).ravel()
-
-# Ирээдүйн 30 хоногийн хүснэгт
-last_date = model_df.index[-1]
-last_lags_raw = model_df[[f"lag_{i}" for i in range(1, n_lag + 1)]].iloc[-1].values
-future_dates_30 = pd.date_range(start=last_date + pd.Timedelta(days=1), periods=30, freq="D")
-future_preds_df = pd.DataFrame({"date": future_dates_30})
-for name, model in MODEL_LIST:
-    if name in y_preds:
-        future_preds_df[name] = forecast_next_daily(model, last_lags_raw, last_date, steps=30)
-
-with pd.ExcelWriter("model_predictions_daily.xlsx", engine="xlsxwriter") as writer:
-    test_preds_df.to_excel(writer, index=False, sheet_name="Test_Predictions_Daily")
-    future_preds_df.to_excel(writer, index=False, sheet_name="Future_30D_Predictions")
-with open("model_predictions_daily.xlsx", "rb") as f:
-    st.download_button("Test/Forecast (өдөр) Excel татах", data=f, file_name="model_predictions_daily.xlsx",
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-st.subheader("Test датан дээрх модел бүрийн бодит болон таамагласан (өдөр, толгой 10 мөр):")
-st.dataframe(test_preds_df.head(10), use_container_width=True)
-
-st.subheader("Хоризонт сонгож графикаар харах:")
-forecast_steps = {"7 хоног": 7, "14 хоног": 14, "30 хоног": 30, "90 хоног": 90,"180 хоног": 180,"365 хоног": 365}
-selected_model = st.selectbox("Модель сонгох:", list(y_preds.keys()))
-selected_h = st.selectbox("Хоризонт:", list(forecast_steps.keys()), index=2)
-steps = forecast_steps[selected_h]
-plot_future = forecast_next_daily(dict(MODEL_LIST)[selected_model], last_lags_raw, last_date, steps)
-plot_dates = pd.date_range(start=last_date + pd.Timedelta(days=1), periods=steps, freq="D")
-future_df = pd.DataFrame({"date": plot_dates, "forecast": plot_future})
-fig = px.line(future_df, x="date", y="forecast", markers=True, title=f"{selected_model} — ирэх {steps} хоногийн прогноз (өдөр)")
-st.plotly_chart(fig, use_container_width=True)
-
-
-# -------------------------- Hotspot (DBSCAN) --------------------------
-
-st.subheader("Анхаарах газрын байршил (DBSCAN кластерчилсан hotspot)")
-if lat_col and lon_col:
-    # Сүүлийн 12 сарын ОЛОНТОЙ (Осол==1) мөрүүдээр кластерчилна
-    recent_df = df[(df["Зөрчил огноо"] >= (df["Зөрчил огноо"].max() - pd.DateOffset(months=12))) & (df["Осол"] == 1)].copy()
-    recent_df = recent_df.dropna(subset=[lat_col, lon_col]).copy()
-    coords = recent_df[[lat_col, lon_col]].to_numpy()
-    if len(coords) >= 3:
-        kms_per_radian = 6371.0088
-        epsilon = 0.1 / kms_per_radian  # ≈100м
-        try:
-            db = DBSCAN(eps=epsilon, min_samples=3, algorithm="ball_tree", metric="haversine").fit(np.radians(coords))
-            recent_df["cluster"] = db.labels_
-        except Exception:
-            # Зарим sklearn хувилбарт metric="haversine" асуудал гарвал euclidean-д шилжинэ (өргөрөг/уртрагийн хэмжээнд ойролцоолол)
-            db = DBSCAN(eps=0.001, min_samples=3, metric="euclidean").fit(coords)
-            recent_df["cluster"] = db.labels_
-    else:
-        recent_df["cluster"] = -1
-
-    hotspots = (
-        recent_df[recent_df["cluster"] != -1]
-        .groupby("cluster")
-        .agg(
-            n_osol=("Осол", "sum"),
-            lat=(lat_col, "mean"),
-            lon=(lon_col, "mean"),
-        )
-        .sort_values("n_osol", ascending=False)
-        .reset_index()
-    )
-
-    map_center_lat = hotspots["lat"].mean() if not hotspots.empty else (recent_df[lat_col].mean() if len(recent_df) else 47)
-    map_center_lon = hotspots["lon"].mean() if not hotspots.empty else (recent_df[lon_col].mean() if len(recent_df) else 106)
-    m = folium.Map(location=[map_center_lat, map_center_lon], zoom_start=12 if not hotspots.empty else 6)
-
-    for _, row in hotspots.iterrows():
-        folium.Circle(
-            location=[row["lat"], row["lon"]],
-            radius=120 + row["n_osol"] * 1,
-            color="orange",
-            fill=True,
-            fill_opacity=0.55,
-            popup=folium.Popup(f"<b>Hotspot (кластер)</b><br>Ослын тоо: <b>{int(row['n_osol'])}</b>", max_width=350),
-        ).add_to(m)
-
-    st_folium(m, width=1920, height=700)
+if grouped.empty or len(grouped) < 10:
+    st.warning(f"Сургалт хийхэд хангалттай сар тутмын өгөгдөл алга (lag={n_lag}). Он/сараа шалгана уу.")
 else:
-    st.info("Координатын баганууд (Өргөрөг/Уртраг эсхүл lat/lon) байхгүй тул газрын зургийг алгаслаа.")
+    feature_cols = [f"osol_lag_{i}" for i in range(1, n_lag + 1)] + top_features
+    X = grouped[feature_cols].fillna(0.0).values
+    y = grouped["osol_count"].values.reshape(-1, 1)
+
+    # Scale
+    split_ratio = st.sidebar.slider("Train ratio", 0.5, 0.9, 0.8, 0.05)
+    train_size = int(len(X) * split_ratio)
+
+    X_train, y_train = X[:train_size], y[:train_size].reshape(-1, 1)
+    X_test, y_test = X[train_size:], y[train_size:].reshape(-1, 1)
+
+    # Scale зөв дарааллаар
+    scaler_X = MinMaxScaler()
+    X_train = scaler_X.fit_transform(X_train)
+    X_test = scaler_X.transform(X_test)
+
+    scaler_y = MinMaxScaler()
+    y_train = scaler_y.fit_transform(y_train).flatten()
+    y_test = scaler_y.transform(y_test).flatten()
+
+    estimators = [
+        ("rf", RandomForestRegressor(n_estimators=120, random_state=42)),
+        ("ridge", Ridge()),
+        ("dt", DecisionTreeRegressor(random_state=42)),
+    ]
+
+    MODEL_LIST = [
+        ("LinearRegression", LinearRegression()),
+        ("Ridge", Ridge()),
+        ("Lasso", Lasso()),
+        ("DecisionTree", DecisionTreeRegressor(random_state=42)),
+        ("RandomForest", RandomForestRegressor(random_state=42)),
+        ("ExtraTrees", ExtraTreesRegressor(random_state=42)),
+        ("GradientBoosting", GradientBoostingRegressor(random_state=42)),
+        ("HistGB", HistGradientBoostingRegressor(random_state=42)),
+        ("AdaBoost", AdaBoostRegressor(random_state=42)),
+        ("KNeighbors", KNeighborsRegressor()),
+        ("SVR", SVR()),
+        ("MLPRegressor", MLPRegressor(hidden_layer_sizes=(64, 32), max_iter=800, random_state=42)),
+        ("ElasticNet", ElasticNet()),
+        ("Stacking", StackingRegressor(estimators=estimators, final_estimator=LinearRegression(), cv=5)),
+    ]
+    if XGBRegressor is not None:
+        MODEL_LIST.append(("XGBRegressor", XGBRegressor(tree_method="gpu_hist", predictor="gpu_predictor", random_state=42)))
+    if CatBoostRegressor is not None:
+        MODEL_LIST.append(("CatBoostRegressor", CatBoostRegressor(task_type="GPU", devices="0", random_state=42, verbose=0)))
+    if LGBMRegressor is not None:
+        MODEL_LIST.append(("LGBMRegressor", LGBMRegressor(device="gpu", gpu_platform_id=0, gpu_device_id=0, random_state=42)))
+
+    # ====================================================
+    # 🆕 VotingRegressor + StackingEnsemble нэмсэн хэсэг
+    # ====================================================
+    from sklearn.ensemble import VotingRegressor, StackingRegressor
+
+    voting_estimators = []
+    if XGBRegressor is not None:
+        voting_estimators.append(("xgb", XGBRegressor(tree_method="gpu_hist", predictor="gpu_predictor", random_state=42)))
+    if LGBMRegressor is not None:
+        voting_estimators.append(("lgbm", LGBMRegressor(device="gpu", gpu_platform_id=0, gpu_device_id=0, random_state=42)))
+    if CatBoostRegressor is not None:
+        voting_estimators.append(("cat", CatBoostRegressor(task_type="GPU", devices="0", random_state=42, verbose=0)))
+    voting_estimators.append(("rf", RandomForestRegressor(n_estimators=200, random_state=42)))
+    voting_estimators.append(("gb", GradientBoostingRegressor(random_state=42)))
+
+    if len(voting_estimators) > 1:
+        MODEL_LIST.append(("VotingRegressor", VotingRegressor(estimators=voting_estimators)))
+
+    stacking_estimators = [("rf", RandomForestRegressor(random_state=42))]
+    if XGBRegressor is not None:
+        stacking_estimators.append(("xgb", XGBRegressor(random_state=42)))
+    if LGBMRegressor is not None:
+        stacking_estimators.append(("lgbm", LGBMRegressor(random_state=42)))
+    if CatBoostRegressor is not None:
+        stacking_estimators.append(("cat", CatBoostRegressor(verbose=0, random_state=42)))
+
+    MODEL_LIST.append((
+        "StackingEnsemble",
+        StackingRegressor(estimators=stacking_estimators, final_estimator=LinearRegression(), cv=5)
+    ))
+
+
+    progress_bar = st.progress(0, text="ML моделийг сургаж байна...")
+    results = []
+    y_preds = {}
+
+    for i, (name, model) in enumerate(MODEL_LIST):
+        try:
+            model.fit(X_train, y_train)
+            y_pred = model.predict(X_test)
+            y_preds[name] = y_pred
+            mae = mean_absolute_error(y_test, y_pred)
+            mse = mean_squared_error(y_test, y_pred)
+            rmse = float(np.sqrt(mse))
+            r2 = r2_score(y_test, y_pred)
+            results.append({"Model": name, "MAE": mae, "RMSE": rmse, "R2": r2})
+        except Exception as e:
+            results.append({"Model": name, "MAE": np.nan, "RMSE": np.nan, "R2": np.nan, "Error": str(e)})
+        progress = min(int((i + 1) / len(MODEL_LIST) * 100), 100)
+        progress_bar.progress(progress, text=f"{name} дууслаа")
+
+    progress_bar.empty()
+    st.success("Бүх ML модел сургагдлаа!")
+
+    results_df = pd.DataFrame(results).sort_values("RMSE", na_position="last")
+    st.dataframe(results_df, use_container_width=True)
+
+    # Excel татах (метрик)
+    with pd.ExcelWriter("model_metrics.xlsx", engine="xlsxwriter") as writer:
+        results_df.to_excel(writer, index=False)
+    with open("model_metrics.xlsx", "rb") as f:
+        st.download_button(
+            "Моделийн метрик Excel татах",
+            data=f,
+            file_name="model_metrics.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+    # Ирээдүйн прогноз helper
+    # Ирээдүйн прогноз helper
+    def forecast_next(model, last_values, steps=12):
+        preds = []
+        seq = last_values.copy()
+        for _ in range(steps):
+            pred = model.predict([seq])[0]
+            preds.append(pred)
+            seq = np.roll(seq, -1)
+            seq[-1] = pred
+        return np.array(preds)
+
+    forecast_steps = {"30 хоног": 1, "90 хоног": 3, "180 хоног": 6, "365 хоног": 12}
+    model_forecasts = {}
+    # 🛠 Алдааг зассан: X_scaled биш X_test ашиглав
+    last_seq = X_test[-1]
+
+    for name, model in MODEL_LIST:
+        if name not in y_preds:
+            continue
+        preds_dict = {}
+        for k, s in forecast_steps.items():
+            scaled_preds = forecast_next(model, last_seq, steps=s)
+            inv_preds = scaler_y.inverse_transform(scaled_preds.reshape(-1, 1)).flatten()
+            preds_dict[k] = inv_preds
+        model_forecasts[name] = preds_dict
+
+    # Test дээрх бодит/таамаг
+    test_dates = grouped["date"].iloc[-len(X_test):].values
+    test_true = scaler_y.inverse_transform(y_test.reshape(-1, 1)).flatten()
+    test_preds_df = pd.DataFrame({"date": test_dates, "real": test_true})
+    for name in model_forecasts.keys():
+        ypi = scaler_y.inverse_transform(np.array(y_preds[name]).reshape(-1, 1)).flatten()
+        test_preds_df[name] = ypi
+
+    # Ирээдүйн 12 сарын таамаг (модел бүрээр)
+    future_dates = pd.date_range(start=grouped["date"].iloc[-1] + pd.offsets.MonthBegin(), periods=12, freq="MS")
+    future_preds_df = pd.DataFrame({"date": future_dates})
+    for name, model in MODEL_LIST:
+        if name not in y_preds:
+            continue
+        scaled_preds = forecast_next(model, last_seq, steps=12)
+        inv_preds = scaler_y.inverse_transform(scaled_preds.reshape(-1, 1)).flatten()
+        future_preds_df[name] = inv_preds
+
+    with pd.ExcelWriter("model_predictions.xlsx", engine="xlsxwriter") as writer:
+        test_preds_df.to_excel(writer, index=False, sheet_name="Test_Predictions")
+        future_preds_df.to_excel(writer, index=False, sheet_name="Future_Predictions")
+    with open("model_predictions.xlsx", "rb") as f:
+        st.download_button(
+            "Test/Forecast бүх моделийн таамаглалуудыг Excel-р татах",
+            data=f,
+            file_name="model_predictions.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+    st.subheader("Test датан дээрх модел бүрийн бодит болон таамагласан утгууд (толгой 10 мөр):")
+    st.dataframe(test_preds_df.head(10), use_container_width=True)
+
+    st.subheader("Ирээдүйн 12 сарын прогноз (модел бүрээр):")
+    st.dataframe(future_preds_df, use_container_width=True)
+
+    st.subheader("Хоризонт сонгож графикаар харах:")
+forecast_steps = {"7 хоног": 7, "14 хоног": 14, "30 хоног": 30, "90 хоног": 90, "180 хоног": 180, "365 хоног": 365}
+
+# Модель сонголт (өдөрийн pipeline ажиллаж байгаа эсэхээс шалтгаалан)
+model_options = list(y_preds.keys()) if 'y_preds' in locals() and len(y_preds) > 0 else list(model_forecasts.keys())
+selected_model = st.selectbox("Модель сонгох:", model_options)
+selected_h = st.selectbox("Хоризонт:", list(forecast_steps.keys()), index=2)
+
+# Огнооны нягтрал шилжлүүлт
+gran = st.radio("Дэлгэцлэх огнооны нягтрал №1:", ["Өдөр", "Сар"], index=0, horizontal=True)
+
+steps = forecast_steps[selected_h]
+if 'forecast_next_daily' in globals() and 'last_lags_raw' in globals():
+    # Өдөр тутмын таамаглалтай горим
+    plot_future = forecast_next_daily(dict(MODEL_LIST)[selected_model], last_lags_raw, last_date, steps)
+    plot_dates = pd.date_range(start=last_date + pd.Timedelta(days=1), periods=steps, freq="D")
+    future_df = pd.DataFrame({"date": plot_dates, "forecast": plot_future})
+    if gran == "Сар":
+        future_df = future_df.set_index("date").resample("MS").sum().reset_index()
+    title = f"{selected_model} — ирэх {steps} хоногийн прогноз ({'өдөр' if gran=='Өдөр' else 'сар'})"
+else:
+    # Сарын fallback горим (өдөрийн pipeline байхгүй үед)
+    preds = model_forecasts[selected_model].get(selected_h)
+    months = len(preds) if preds is not None else 0
+    dates_future = pd.date_range(start=grouped["date"].iloc[-1] + pd.offsets.MonthBegin(), periods=months, freq="MS")
+    future_df = pd.DataFrame({"date": dates_future, "forecast": preds})
+    gran = "Сар"
+    title = f"{selected_model} — {selected_h} прогноз (сар)"
+
+fig = px.line(future_df, x="date", y="forecast", markers=True, title=title)
+st.plotly_chart(fig, use_container_width=True)
 
 # -------------------------- 1. Корреляцийн шинжилгээ --------------------------
 
@@ -471,7 +545,7 @@ if len(vars_for_corr) > 1:
     Xx = df[vars_for_corr].fillna(0.0).values
     yy = pd.to_numeric(df["Осол"], errors="coerce").fillna(0).values
     try:
-        rf_cor = RandomForestRegressor(n_estimators=200, random_state=seed)
+        rf_cor = RandomForestRegressor(n_estimators=200, random_state=42)
         rf_cor.fit(Xx, yy)
         importances_cor = rf_cor.feature_importances_
         indices_cor = np.argsort(importances_cor)[::-1]
@@ -491,17 +565,21 @@ else:
     st.warning("Сонгох хувьсагчидыг оруулна уу!")
 
 # -------------------------- 2. Ослын өсөлтийн тренд --------------------------
-st.header("2. Ослын өсөлтийн тренд")
-mode_trend = st.radio("Дэлгэцлэх огнооны нягтрал:", ["Өдөр", "Сар"], index=0, horizontal=True)
-
-if mode_trend == "Өдөр":
-    daily_tr = df[df["Осол"] == 1].groupby("Date").agg(osol_count=("Осол", "sum")).reset_index()
-    fig = px.line(daily_tr, x="Date", y="osol_count", markers=True, labels={"Date":"Огноо","osol_count":"Ослын тоо"})
-else:
-    monthly_tr = df[df["Осол"] == 1].groupby(["Year","Month"]).agg(osol_count=("Осол","sum")).reset_index()
-    monthly_tr["YearMonth"] = monthly_tr.apply(lambda x: f"{int(x['Year'])}-{int(x['Month']):02d}", axis=1)
-    fig = px.line(monthly_tr, x="YearMonth", y="osol_count", markers=True, labels={"YearMonth":"Он-Сар","osol_count":"Ослын тоо"})
+# -------------------------- 2. Ослын өсөлтийн тренд --------------------------
+st.header("2. Ослын өсөлтийн тренд") 
+st.subheader("Жил, сар бүрээр ослын тооны тренд") 
+trend_data = ( df[df["Осол"] == 1] .groupby(["Year", "Month"]) .agg(osol_count=("Осол", "sum")) .reset_index() ) 
+trend_data["YearMonth"] = trend_data.apply(lambda x: f"{int(x['Year'])}-{int(x['Month']):02d}", axis=1) 
+available_years = sorted(trend_data["Year"].unique()) 
+year_options = ["Бүгд"] + [str(y) for y in available_years] 
+selected_year = st.selectbox("Жил сонгох:", year_options) 
+plot_df = trend_data if selected_year == "Бүгд" else trend_data[trend_data["Year"] == int(selected_year)].copy() 
+fig = px.line(plot_df, x="YearMonth", y="osol_count", markers=True, labels={"YearMonth": "Он-Сар", "osol_count": "Ослын тоо"}, title="") 
+fig.update_layout( xaxis_tickangle=45, hovermode="x unified", plot_bgcolor="white", yaxis=dict(title="Ослын тоо", rangemode="tozero"), xaxis=dict(title="Он-Сар"), ) 
+fig.update_traces(line=dict(width=3)) 
+st.write("Доорх графикт ослын тооны өөрчлөлтийг харуулав.") 
 st.plotly_chart(fig, use_container_width=True)
+
 
 
 # -------------------------- 4. Категори хамаарал (Cramér’s V + Chi-square) --------------------------
@@ -525,12 +603,9 @@ else:
 
     table = pd.crosstab(df[var1], df[var2])
     chi2, p, dof, expected = chi2_contingency(table)
-
-    # Хоёр хувилбарын V
     n = table.values.sum()
     r, k = table.shape
-    cramers_v_naive = np.sqrt(chi2 / (n * (min(k, r) - 1))) if min(k, r) > 1 else np.nan
-    cramers_v_bc = cramers_v_bias_corrected(table)
+    cramers_v = np.sqrt(chi2 / (n * (min(k, r) - 1))) if min(k, r) > 1 else np.nan
 
     st.subheader("1. Chi-square тест")
     st.write("p-value < 0.05 бол статистикийн хувьд хамааралтай гэж үзнэ.")
@@ -541,25 +616,399 @@ else:
     else:
         st.info("p ≥ 0.05 → Статистикийн хувьд хамааралгүй.")
 
-    use_bc = st.checkbox("Bias-corrected Cramér’s V (санал болгож байна)", value=True)
-    v_to_show = cramers_v_bc if use_bc else cramers_v_naive
-
     st.subheader("2. Cramér’s V")
     st.write("0-д ойрхон бол бараг хамааралгүй, 1-д ойр бол хүчтэй хамааралтай.")
-    st.write(f"**Cramér’s V:** {v_to_show:.3f} (0=хамааралгүй, 1=хүчтэй хамаарал)")
+    st.write(f"**Cramér’s V:** {cramers_v:.3f} (0=хамааралгүй, 1=хүчтэй хамаарал)")
 
     st.write("**Crosstab:**")
     st.dataframe(table, use_container_width=True)
 
 # -------------------------- Төслийн төгсгөл --------------------------
+def get_season(month: int) -> str:
+    if month in [12, 1, 2]:
+        return "Өвөл"
+    elif month in [3, 4, 5]:
+        return "Хавар"
+    elif month in [6, 7, 8]:
+        return "Зун"
+    elif month in [9, 10, 11]:
+        return "Намар"
+    return "Тодорхойгүй"
+
+df["Season"] = df["Зөрчил огноо"].dt.month.apply(get_season)
+
+# Crosstab + χ² + Cramér’s V
+table = pd.crosstab(df["Season"], df["Төрөл"])
+chi2, p, dof, exp = chi2_contingency(table)
+n = table.values.sum()
+r, k = table.shape
+cramers_v = np.sqrt(chi2 / (n*(min(k,r)-1)))
+
+st.subheader("Улирлын ялгаа (χ² ба Cramér’s V)")
+st.write("**Chi-square statistic:**", round(chi2, 3))
+st.write("**p-value:**", round(p, 4))
+st.write("**Cramér’s V:**", round(cramers_v, 3))
+st.dataframe(table, use_container_width=True)
+
+
+
+
+
+
+# -------------------------- 6. Empirical Bayes шинжилгээ --------------------------
+
+st.header("6. Empirical Bayes before–after шинжилгээ (сар бүр)")
+
+
+def empirical_bayes(obs, exp, prior_mean, prior_var):
+    """EB хүлээгдэж буй vs ажиглагдсан тооцоолол"""
+    weight = prior_var / (prior_var + exp)
+    return weight * obs + (1 - weight) * prior_mean
+
+# Сар бүрийн агрегат (аль хэдийн trend_data дээр байгаа)
+monthly = (
+    df[df["Осол"] == 1]
+    .groupby(["Year", "Month"])
+    .agg(osol_count=("Осол", "sum"))
+    .reset_index()
+)
+monthly["date"] = pd.to_datetime(monthly[["Year", "Month"]].assign(DAY=1))
+
+# Before/After хуваалт: 2020–2022 before, 2023–2024 after
+monthly["period"] = np.where(monthly["Year"] <= 2023, "before", "after")
+
+# Хүлээгдэж буй утга = before үеийн дундаж
+expected = monthly[monthly["period"]=="before"]["osol_count"].mean()
+prior_mean = expected
+prior_var = expected / 2
+
+# EB-г зөвхөн after дээр тооцно
+monthly["EB"] = monthly.apply(
+    lambda row: empirical_bayes(
+        row["osol_count"], expected, prior_mean, prior_var
+    ) if row["period"]=="after" else row["osol_count"],
+    axis=1
+)
+
+# st.write("EB үр дүн (сар бүрийн түвшинд):")
+# st.dataframe(monthly.head(24))
+
+# Графикаар харуулах
+fig = px.line(
+    monthly, x="date", y=["osol_count","EB"], 
+    color="period", markers=True,
+    labels={"value":"Осол (тоо)", "date":"Он-Сар"},
+    title="Ослын сар бүрийн тоо (EB жинлэлийн коэффициент)"
+)
+st.plotly_chart(fig, use_container_width=True)
+
+# -------------------------- 7. Empirical Bayes шинжилгээ (байршлаар, сар бүр) --------------------------
+st.header("7. Empirical Bayes before–after шинжилгээ (байршлаар, сар бүр)")
+
+st.markdown("""
+EB жинлэлийн коэффициент гэж юу вэ?
+Empirical Bayes (EB) арга нь бодит ажиглагдсан (Observed) болон хүлээгдэж буй (Expected) утгыг 
+жинлэж нэгтгэдэг статистик аргачлал юм. Энэ нь санамсаргүй хэлбэлзлээс шалтгаалсан гажуудлыг 
+багасгах зорилготой.
+
+Математик загварчлал:
+
+EB = w * Observed + (1 - w) * Expected  
+w = PriorVar / (PriorVar + Expected)
+
+- **Observed** = тухайн сар/байршлын ослын тоо  
+- **Expected** = өмнөх хугацааны дундаж ослын тоо  
+- **PriorVar** = суурь хэлбэлзэл (дундажийн талыг ашигласан)
+
+""")
+
+
+def empirical_bayes(obs, exp, prior_mean, prior_var):
+    """EB жигнэлт: ажиглагдсан ба хүлээгдэж буйг нэгтгэх"""
+    weight = prior_var / (prior_var + exp)
+    return weight * obs + (1 - weight) * prior_mean
+
+# -------------------------- Байршлын баганыг таних --------------------------
+loc_col = resolve_col(df, ["Замын байршил", "Байршил", "location", "Road Location"])
+if loc_col is None:
+    st.error("⚠️ Замын байршлын багана олдсонгүй. Excel дээр 'Замын байршил' гэх мэт багана байгаа эсэхийг шалгана уу.")
+    st.stop()
+
+# -------------------------- Сар бүрийн агрегат --------------------------
+monthly_loc = (
+    df[df["Осол"] == 1]
+    .groupby([loc_col, "Year", "Month"])
+    .agg(osol_count=("Осол", "sum"))
+    .reset_index()
+)
+monthly_loc["date"] = pd.to_datetime(monthly_loc[["Year", "Month"]].assign(DAY=1))
+
+# -------------------------- Before/After хугацаа сонгох (жилээр) --------------------------
+years = sorted(df["Year"].unique())
+col1, col2, col3, col4 = st.columns(4)
+with col1:
+    before_start = st.selectbox("Before эхлэх жил", years, index=0)
+with col2:
+    before_end = st.selectbox("Before дуусах жил", years, index=len(years)//2 - 1)
+with col3:
+    after_start = st.selectbox("After эхлэх жил", years, index=len(years)//2)
+with col4:
+    after_end = st.selectbox("After дуусах жил", years, index=len(years)-1)
+
+before_range = (pd.to_datetime(f"{before_start}-01-01"), pd.to_datetime(f"{before_end}-12-31"))
+after_range = (pd.to_datetime(f"{after_start}-01-01"), pd.to_datetime(f"{after_end}-12-31"))
+
+# -------------------------- Period оноох --------------------------
+monthly_loc["period"] = np.where(
+    (monthly_loc["date"] >= before_range[0]) & (monthly_loc["date"] <= before_range[1]),
+    "before",
+    np.where(
+        (monthly_loc["date"] >= after_range[0]) & (monthly_loc["date"] <= after_range[1]),
+        "after",
+        "outside"
+    )
+)
+
+# зөвхөн before/after үлдээнэ
+monthly_loc = monthly_loc[monthly_loc["period"].isin(["before","after"])]
+
+# -------------------------- EB тооцоолол --------------------------
+results = []
+for loc, grp in monthly_loc.groupby(loc_col):
+    expected = grp[grp["period"] == "before"]["osol_count"].mean()
+    if pd.isna(expected):  # before хоосон бол алгасна
+        continue
+    prior_mean = expected
+    prior_var = expected / 2
+
+    grp["EB"] = grp.apply(
+        lambda row: empirical_bayes(
+            row["osol_count"], expected, prior_mean, prior_var
+        ) if row["period"] == "after" else row["osol_count"],
+        axis=1
+    )
+    results.append(grp)
+
+if results:
+    monthly_loc = pd.concat(results)
+else:
+    st.warning("⚠️ Сонгосон хугацаанд EB тооцоолох өгөгдөл олдсонгүй.")
+
+# -------------------------- OUTPUT --------------------------
+st.write("EB үр дүн (байршлаар, сар бүр):")
+st.dataframe(monthly_loc.head(500))
+
+# График
+if not monthly_loc.empty:
+    fig = px.line(
+        monthly_loc, x="date", y="EB",
+        color=loc_col, line_dash="period", markers=True,
+        labels={"EB":"EB-жигнэсэн ослын тоо", "date":"Он-Сар", loc_col:"Байршил"},
+        title="Ослын EB-жигнэлттэй тоо (байршлаар, сар бүр)"
+    )
+    st.plotly_chart(fig, use_container_width=True)
+# -------------------------- 8. Байршлын өөрчлөлтөөр эрэмбэлэх --------------------------
+st.header("8. Хамгийн сайн / муу 100 байршлын жагсаалт")
+
+# Before / After дундаж EB-г тооцоолох
+summary = (
+    monthly_loc.groupby([loc_col, "period"])["EB"]
+    .mean()
+    .reset_index()
+    .pivot(index=loc_col, columns="period", values="EB")
+    .reset_index()
+)
+
+# Before ба After ялгавар
+summary["Δ"] = summary["after"] - summary["before"]
+
+# Хамгийн сайн 100 (Δ хамгийн бага)
+best_100 = summary.nsmallest(100, "Δ")
+
+# Хамгийн муу 100 (Δ хамгийн их)
+worst_100 = summary.nlargest(100, "Δ")
+
+# ==================== OUTPUT ====================
+st.subheader("✅ Хамгийн сайн 100 байршил (EB буурсан)")
+st.dataframe(best_100)
+
+st.subheader("❌ Хамгийн муу 100 байршил (EB нэмэгдсэн)")
+st.dataframe(worst_100)
+
+# Хүсвэл Excel болгож татаж авах
+def convert_df(df):
+    return df.to_csv(index=False).encode("utf-8-sig")
+
+st.download_button(
+    "📥 Best 100 (CSV)", convert_df(best_100), "best_100.csv", "text/csv"
+)
+
+st.download_button(
+    "📥 Worst 100 (CSV)", convert_df(worst_100), "worst_100.csv", "text/csv"
+)
+
 
 st.markdown(
     """
     ---
     **Тайлбар**  
     • Зорилтот хувьсагчийг Sidebar дээрээс сонгох боломжтой (Гэмт хэрэг/Зөрчлийн хэрэг/Хосолсон).  
-    • "Leakage-free" scaling: scaler-уудыг зөвхөн train дээр fit хийдэг тул үнэлгээ илүү найдвартай.  
-    • ⚡ Хурдан ажиллуулахад 200 мөрийн санамсаргүй дэд дээж авч туршина.  
+    • Том хэмжээтэй файлуудад `@st.cache_data` ачааллааг бууруулна.  
     • Хэрэв XGBoost/LightGBM/CatBoost суулгагдаагүй бол суулгалгүйгээр бусад моделүүд ажиллана.  
     """
 )
+
+
+# ============================================================
+# 9. Координат удамшуулах (2024 → 2020–2023) + DBSCAN шинжилгээ
+# ============================================================
+# ============================================================
+# 9. Координат удамшуулах (2024 → 2020–2023) + DBSCAN шинжилгээ + Газрын зураг
+# ============================================================
+
+st.header("9. Удамшсан координат дээр DBSCAN кластерчилал")
+
+# --- шаардлагатай баганууд ---
+req_cols = ["Замын код", "Аймаг-Дүүрэг", "Хороо-Сум", "Зөрчил гарсан газрын хаяг", "Замын байршил"]
+missing_cols = [c for c in req_cols if c not in df.columns]
+if missing_cols:
+    st.error(f"Дараах баганууд датанд алга байна: {missing_cols}")
+else:
+    # --- 9.1 Reference (2024 он) бэлтгэх ---
+    df_2024 = df[df["Year"] == 2024].copy()
+    df_2024["ref_key"] = (
+        df_2024["Замын код"].astype(str) + "_" +
+        df_2024["Аймаг-Дүүрэг"].astype(str) + "_" +
+        df_2024["Хороо-Сум"].astype(str) + "_" +
+        df_2024["Зөрчил гарсан газрын хаяг"].astype(str) + "_" +
+        df_2024["Замын байршил"].astype(str)
+    )
+    df_2024_grouped = (
+        df_2024.groupby("ref_key")[[lat_col, lon_col]]
+        .agg(lambda x: x.mode()[0])
+        .reset_index()
+    )
+    ref_dict = df_2024_grouped.set_index("ref_key")[[lat_col, lon_col]].to_dict("index")
+
+    # --- 9.2 Координат удамшуулах функц ---
+    from haversine import haversine
+    def inherit_coords(row, threshold_m=500):
+        if row["Year"] == 2024:
+            return row[lat_col], row[lon_col]
+        key = (
+            str(row["Замын код"]) + "_" +
+            str(row["Аймаг-Дүүрэг"]) + "_" +
+            str(row["Хороо-Сум"]) + "_" +
+            str(row["Зөрчил гарсан газрын хаяг"]) + "_" +
+            str(row["Замын байршил"])
+        )
+        if key in ref_dict:
+            ref_lat = ref_dict[key][lat_col]
+            ref_lon = ref_dict[key][lon_col]
+            try:
+                dist = haversine((ref_lat, ref_lon), (row[lat_col], row[lon_col])) * 1000
+            except:
+                dist = np.inf
+            if (41 <= row[lat_col] <= 52) and (87 <= row[lon_col] <= 120):
+                return (row[lat_col], row[lon_col]) if dist <= threshold_m else (ref_lat, ref_lon)
+            else:
+                return ref_lat, ref_lon
+        else:
+            return np.nan, np.nan
+
+    df[[lat_col, lon_col]] = df.apply(lambda row: inherit_coords(row), axis=1, result_type="expand")
+    df = df.dropna(subset=[lat_col, lon_col])
+
+    # --- 9.3 DBSCAN кластерчилал ---
+    coords = df[[lat_col, lon_col]].to_numpy()
+    if len(coords) > 5:
+        db = DBSCAN(eps=0.001, min_samples=5, metric="haversine")
+        df["cluster_inherited"] = db.fit_predict(np.radians(coords))
+    else:
+        df["cluster_inherited"] = -1
+
+    # --- 9.4 Кластер тренд тооцох ---
+    trend_list = []
+    for cl in df["cluster_inherited"].unique():
+        if cl == -1:
+            continue
+        subset = df[df["cluster_inherited"] == cl]
+        counts = subset.groupby("Year").size()
+        if counts.shape[0] < 2:
+            trend = "тогтвортой"
+        else:
+            diff = counts.diff().dropna()
+            if all(diff > 0):
+                trend = "өсөлт"
+            elif all(diff < 0):
+                trend = "бууралт"
+            elif diff.max() > 2 * abs(diff.mean()): 
+                trend = "огцом өсөлт"
+            elif diff.min() < -2 * abs(diff.mean()):
+                trend = "огцом бууралт"
+            else:
+                trend = "тогтвортой"
+        trend_list.append({"cluster": cl, "trend": trend, "тоо": counts.sum()})
+    df_trend = pd.DataFrame(trend_list).sort_values("тоо", ascending=False)
+
+    st.subheader("Кластерийн трендүүд (2020–2024)")
+    st.dataframe(df_trend, use_container_width=True)
+
+    # --- 9.5 Binary хувьсагчийн ач холбогдол ---
+    from sklearn.ensemble import RandomForestClassifier
+    if binary_cols:
+        X = df[binary_cols]
+        y = df["cluster_inherited"].astype(str)
+        rf = RandomForestClassifier(n_estimators=200, random_state=42)
+        rf.fit(X, y)
+        feature_imp = pd.DataFrame({
+            "feature": binary_cols,
+            "importance": rf.feature_importances_
+        }).sort_values("importance", ascending=False)
+        st.subheader("Binary хувьсагчийн ач холбогдол (RandomForest importance)")
+        st.dataframe(feature_imp, use_container_width=True)
+    else:
+        st.info("Binary (0/1) багана олдсонгүй, importance тооцоогүй.")
+
+    # --- 9.6 Газрын зураг дээр дүрслэх ---
+    import folium
+    from streamlit_folium import st_folium
+    st.subheader("DBSCAN кластеруудын газрын зураг (2020–2024)")
+
+    if len(df) > 0:
+        m = folium.Map(location=[47.92, 106.92], zoom_start=5, tiles="OpenStreetMap")
+
+        import matplotlib.cm as cm
+        import matplotlib.colors as colors
+        clusters = df["cluster_inherited"].unique()
+        norm = colors.Normalize(vmin=min(clusters), vmax=max(clusters))
+        colormap = cm.ScalarMappable(norm=norm, cmap="tab20")
+
+        trend_dict = dict(zip(df_trend["cluster"], df_trend["trend"]))
+
+        for _, row in df.iterrows():
+            cl = row["cluster_inherited"]
+            popup_txt = (
+                f"Он: {row['Year']}<br>"
+                f"Замын код: {row['Замын код']}<br>"
+                f"Аймаг-Дүүрэг: {str(row['Аймаг-Дүүрэг'])}<br>"
+                f"Хороо-Сум: {str(row['Хороо-Сум'])}<br>"
+                f"Байршил: {str(row['Замын байршил'])}<br>"
+                f"Кластер: {cl}<br>"
+                f"Тренд: {trend_dict.get(cl, 'N/A')}"
+            )
+            color = "gray" if cl == -1 else colors.to_hex(colormap.to_rgba(cl))
+            folium.CircleMarker(
+                location=[row[lat_col], row[lon_col]],
+                radius=4,
+                color=color,
+                fill=True,
+                fill_opacity=0.7,
+                popup=popup_txt
+            ).add_to(m)
+
+        st_folium(m, width=900, height=600)
+    else:
+        st.info("Газрын зурагт харуулах дата алга.")
+
+
