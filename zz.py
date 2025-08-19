@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 # ============================================================
 # Зам тээврийн осол — Auto ML & Hotspot Dashboard (Streamlit)
-# Хувилбар: 2025-08-17r3 (refined+) — leakage-гүй, TSCV + Poisson,
+# Хувилбар: 2025-08-17r3.1 (refined++) — leakage-гүй, TSCV + Poisson,
 #            САР ба ӨДӨР аль алинд нь таамаглал (динамик улирлын экзоген)
+#            + бодит нэгжийн метрик, integer прогноз, өдөр гөлгөршүүлэх
 # ============================================================
 
 from __future__ import annotations
@@ -227,6 +228,7 @@ if len(feature_pool) == 0:
     st.stop()
 
 # -------------------------- SERIES BUILD (Сар/Өдөр) --------------------------
+
 def build_monthly(df_in: pd.DataFrame):
     # Target
     monthly_target = (
@@ -268,6 +270,7 @@ def build_monthly(df_in: pd.DataFrame):
 
     exog_cols = feature_pool + fourier_cols
     return grouped, lag_cols, fourier_cols, exog_cols, n_lag, "MS"  # month start freq
+
 
 def build_daily(df_in: pd.DataFrame):
     # Build continuous daily index
@@ -459,10 +462,12 @@ if CatBoostRegressor is not None:
 MODEL_LIST.append(("StackingEnsemble", StackingRegressor(estimators=stacking_estimators, final_estimator=LinearRegression(), cv=5)))
 
 # -------------------------- Rolling Backtest (optional) --------------------------
+
 def smape(y_true, y_pred, eps=1e-8):
     y_true = np.asarray(y_true, float); y_pred = np.asarray(y_pred, float)
     denom = np.maximum((np.abs(y_true) + np.abs(y_pred)) / 2.0, eps)
     return float(np.mean(np.abs(y_pred - y_true) / denom))
+
 
 def mase(y_insample, y_true, y_pred, m=12, eps=1e-8):
     y_insample = np.asarray(y_insample, float).ravel()
@@ -470,6 +475,7 @@ def mase(y_insample, y_true, y_pred, m=12, eps=1e-8):
         return float(np.nan)
     denom = np.mean(np.abs(y_insample[m:] - y_insample[:-m]))
     return float(np.mean(np.abs(y_pred - y_true) / (denom + eps)))
+
 
 def rolling_backtest(X_raw, y_raw, model_list, n_splits=5):
     tscv = TimeSeriesSplit(n_splits=n_splits)
@@ -515,22 +521,35 @@ for i, (name, model) in enumerate(MODEL_LIST):
     try:
         model.fit(X_train, y_train)
         fitted_models[name] = model
-        y_pred = np.asarray(model.predict(X_test)).reshape(-1)
-        y_preds[name] = y_pred
-        mae = mean_absolute_error(y_test, y_pred)
-        mse = mean_squared_error(y_test, y_pred)
-        rmse = float(np.sqrt(mse))
-        r2 = r2_score(y_test, y_pred)
-        results.append({"Model": name, "MAE": mae, "RMSE": rmse, "R2": r2})
+
+        # scaled prediction for R2, and keep for later inverse-transform
+        y_pred_s = np.asarray(model.predict(X_test)).reshape(-1)
+        y_preds[name] = y_pred_s
+        r2_s = r2_score(y_test, y_pred_s)
+
+        # inverse-scale metrics in REAL units
+        y_true = scaler_y.inverse_transform(y_test.reshape(-1,1)).ravel()
+        y_pred = scaler_y.inverse_transform(y_pred_s.reshape(-1,1)).ravel()
+        y_pred = np.clip(y_pred, 0, None)
+
+        results.append({
+            "Model": name,
+            "MAE (real)": mean_absolute_error(y_true, y_pred),
+            "RMSE (real)": float(np.sqrt(mean_squared_error(y_true, y_pred))),
+            "R2 (scaled)": float(r2_s)
+        })
     except Exception as e:
-        results.append({"Model": name, "MAE": np.nan, "RMSE": np.nan, "R2": np.nan, "Error": str(e)})
+        results.append({"Model": name, "MAE (real)": np.nan, "RMSE (real)": np.nan, "R2 (scaled)": np.nan, "Error": str(e)})
     progress = min(int((i + 1) / len(MODEL_LIST) * 100), 100)
     progress_bar.progress(progress, text=f"{name} дууслаа")
 progress_bar.empty()
 st.success("Бүх ML модел сургагдлаа!")
 
-results_df = pd.DataFrame(results).sort_values("RMSE", na_position="last")
-st.dataframe(results_df, use_container_width=True)
+results_df = pd.DataFrame(results).sort_values("RMSE (real)", na_position="last")
+st.dataframe(
+    results_df.style.format({"MAE (real)": "{:.3f}", "RMSE (real)": "{:.3f}", "R2 (scaled)": "{:.4f}"}),
+    use_container_width=True,
+)
 
 # Excel татах (метрик)
 with pd.ExcelWriter("model_metrics.xlsx", engine="xlsxwriter") as writer:
@@ -643,6 +662,9 @@ for name in model_forecasts.keys():
     ypi = scaler_y.inverse_transform(np.array(y_preds[name]).reshape(-1, 1)).flatten()
     ypi = np.clip(ypi, 0, None)
     test_preds_df[name] = ypi
+# integer хувилбарууд
+for col in list(test_preds_df.columns)[2:]:
+    test_preds_df[col + "_int"] = np.rint(test_preds_df[col]).astype(int)
 
 # Ирээдүйн 12 нэгжийн таамаг: сар горимд 12 САР, өдөр горимд 365 ӨДӨР (дохио)
 future_steps = 12 if agg_mode == "Сар" else 365
@@ -656,6 +678,10 @@ for name, model in fitted_models.items():
         model, last_row_raw, steps=future_steps, last_date=last_known_date,
         mode=agg_mode, seasonal_cols=seasonal_cols, feature_cols=feature_cols
     )
+# integer columns + clip to 0
+for col in list(future_preds_df.columns)[1:]:
+    future_preds_df[col] = np.clip(future_preds_df[col], 0, None)
+    future_preds_df[col + "_int"] = np.rint(future_preds_df[col]).astype(int)
 
 with pd.ExcelWriter("model_predictions.xlsx", engine="xlsxwriter") as writer:
     test_preds_df.to_excel(writer, index=False, sheet_name="Test_Predictions")
@@ -674,24 +700,41 @@ st.dataframe(test_preds_df.head(10), use_container_width=True)
 st.subheader(("Ирээдүйн 12 САР" if agg_mode == "Сар" else "Ирээдүйн 365 ӨДӨР") + " — прогноз (модел бүрээр)")
 st.dataframe(future_preds_df, use_container_width=True)
 
-# График UI
+# -------------------------- График UI --------------------------
 model_options = list(model_forecasts.keys())
 if len(model_options) == 0:
     st.warning("Прогноз харах модел олдсонгүй.")
 else:
-    selected_model = st.selectbox("Модель сонгох:", model_options)
+    # Автоматаар best model (RMSE real) default болгох
+    try:
+        best_model_name = results_df.loc[results_df["RMSE (real)"].idxmin(), "Model"]
+    except Exception:
+        best_model_name = None
+    default_index = model_options.index(best_model_name) if best_model_name in model_options else 0
+
+    selected_model = st.selectbox("Модель сонгох:", model_options, index=default_index)
     selected_h = st.selectbox("Хоризонт:", list(h_map.keys()), index=2)
     steps = h_map[selected_h]
     start_future = step_next_date(last_known_date, agg_mode)
     dates_future = pd.date_range(start=start_future, periods=steps, freq=("MS" if agg_mode == "Сар" else "D"))
     future_df = pd.DataFrame({"date": dates_future, "forecast": model_forecasts[selected_model][selected_h]})
+
+    # Өдөр горимд гөлгөршүүлэх сонголт
+    y_col = "forecast"
+    if agg_mode == "Өдөр":
+        smooth_win = st.sidebar.slider("Гөлгөршүүлэх цонх (өдөр)", 1, 21, 7, 1)
+        if smooth_win and smooth_win > 1:
+            future_df["forecast_smooth"] = future_df["forecast"].rolling(smooth_win, min_periods=1).mean()
+            y_col = "forecast_smooth"
+
     fig = px.line(
-        future_df, x="date", y="forecast", markers=True,
+        future_df, x="date", y=y_col, markers=True,
         title=f"{selected_model} — {selected_h} ({'сар' if agg_mode=='Сар' else 'өдөр'}ийн шагналт)"
     )
     st.plotly_chart(fig, use_container_width=True)
 
-# Horizon metrics for selected model
+# -------------------------- Horizon metrics for selected model --------------------------
+
 def horizon_scores(model, X_full, y_full, scaler_y, horizons):
     out = {}
     y_true_full = scaler_y.inverse_transform(y_full.reshape(-1,1)).ravel()
@@ -713,9 +756,11 @@ if len(model_options) > 0:
     hs = horizon_scores(fitted_models[selected_model], X_test, y_test, scaler_y, horizons)
     st.write("Horizon metrics:", hs)
 
-# Naive baselines
+# -------------------------- Naive baselines --------------------------
+
 def naive_forecast(y):
     return np.roll(y, 1)[1:]  # t-1
+
 def snaive_forecast(y, m):
     y_hat = np.roll(y, m)[m:]
     return y_hat
@@ -769,8 +814,7 @@ st.header("2. Ослын өсөлтийн тренд")
 st.subheader("Жил, сар бүрийн ослын тоо")
 trend_data = (
     df[df["Осол"] == 1]
-    .groupby(["Year", "Month"])
-    .agg(osol_count=("Осол", "sum"))
+    .groupby(["Year", "Month"]).agg(osol_count=("Осол", "sum"))
     .reset_index()
 )
 trend_data["YearMonth"] = trend_data.apply(lambda x: f"{int(x['Year'])}-{int(x['Month']):02d}", axis=1)
@@ -820,6 +864,7 @@ else:
     st.dataframe(table, use_container_width=True)
 
 # -------------------------- Улирлын ялгаа --------------------------
+
 def get_season(month: int) -> str:
     if month in [12, 1, 2]:
         return "Өвөл"
