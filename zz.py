@@ -431,7 +431,7 @@ if agg_mode == "Сар":
     grouped, lag_cols, seasonal_cols, exog_cols = build_monthly_cached(df, feature_pool, n_lag)
     freq_code = "MS"
 else:
-    n_lag = st.sidebar.slider("Өдрийн лаг цонх (n_lag)", 7, 120, 30, 1, key="lag_d")
+    n_lag = st.sidebar.slider("Өдрийн лаг цонх (n_lag)", 7, 365, 30, 1, key="lag_d")
     grouped, lag_cols, seasonal_cols, exog_cols = build_daily_cached(df, feature_pool, n_lag, ta_use, ta_params)
     freq_code = "D"
 
