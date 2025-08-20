@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 # ============================================================
 # Зам тээврийн осол — Auto ML & Hotspot Dashboard (Streamlit)
-# Хувилбар: 2025-08-17r3.5 (cached+TA+fix+leap+debias+LY365)
+# Хувилбар: 2025-08-21 r4.0 (leakage-quota + Poisson/Tweedie + PI + directMS + seasonal-bias bands)
 # ============================================================
 
 from __future__ import annotations
-import json
+import json, re
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -17,7 +17,7 @@ import plotly.graph_objects as go
 from pathlib import Path
 
 # Sklearn
-from sklearn.linear_model import LinearRegression, Ridge, Lasso, ElasticNet
+from sklearn.linear_model import LinearRegression, Ridge, Lasso, ElasticNet, TweedieRegressor
 from sklearn.ensemble import (
     RandomForestRegressor, GradientBoostingRegressor, AdaBoostRegressor,
     ExtraTreesRegressor, StackingRegressor, HistGradientBoostingRegressor,
@@ -29,8 +29,8 @@ from sklearn.svm import SVR
 from sklearn.neural_network import MLPRegressor
 from sklearn.preprocessing import MinMaxScaler, FunctionTransformer
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score, make_scorer
-from sklearn.model_selection import TimeSeriesSplit
 from sklearn.inspection import permutation_importance
+from sklearn.multioutput import MultiOutputRegressor
 
 # 3rd-party (optional)
 try:
@@ -59,7 +59,7 @@ RANDOM_STATE = 42
 
 # -------------------------- UI setup --------------------------
 st.set_page_config(page_title="Осол — Auto ML & Hotspot (auto-binary)", layout="wide")
-st.title("С.Цолмон, А.Тамир нарын хар цэгийн судалгаа 2025-08-18")
+st.title("С.Цолмон, А.Тамир нарын хар цэгийн судалгаа — r4.0")
 
 # -------------------------- Helpers --------------------------
 def _canon(s: str) -> str:
@@ -94,28 +94,18 @@ def plot_correlation_matrix(df, title, columns):
     plt.tight_layout()
     return fig
 
-# ---------- NEW: safe integer rounding (avoids IntCastingNaNError) ----------
-# ---------- REPLACE your to_int_safe with this ----------
+# ---------- safe integer rounding ----------
 def to_int_safe(series: pd.Series) -> pd.Series:
-    # 1) Тоон руу хүчээр
     s = pd.to_numeric(series, errors="coerce")
-    # 2) ±inf -> NaN
     s = s.replace([np.inf, -np.inf], np.nan)
-
-    # 3) Хөвөгчийг тойруулж бүхэл рүү ойртуулах
     rounded = np.rint(s.values.astype("float64"))
-
-    # 4) NaN-уудыг түр 0 болгоод NumPy int64 рүү хөрвүүлэх (энд safe-каст шаардлагагүй)
     tmp = np.where(np.isfinite(rounded), rounded, 0.0)
     ints = tmp.astype(np.int64)
-
-    # 5) Series болгож nullable Int64 болгоод, NaN масктай мөрүүдийг <NA> болгон сэргээх
     out = pd.Series(ints, index=series.index, copy=False).astype("Int64")
-    mask = ~np.isfinite(s.values)  # NaN/inf байсан байршлууд
+    mask = ~np.isfinite(s.values)
     if mask.any():
         out[mask] = pd.NA
     return out
-
 
 # -------------------------- Data load (cached) --------------------------
 uploaded_file = st.sidebar.file_uploader("Excel файл оруулах (.xlsx)", type=["xlsx"])
@@ -204,8 +194,7 @@ else:
 # -------------------------- Forecast settings --------------------------
 st.header("5. Ирээдүйн ослын таамаглал (Олон ML/DL загвар)")
 agg_mode = st.sidebar.selectbox("Прогнозын агрегат", ["Сар", "Өдөр"], index=0)
-st.caption("Binary (0/1) шинжүүд автоматаар илрүүлэгдэнэ. **Сар / Өдөр** хоёр горим. "
-           "Өдөр горимд 7 хоног/365–366 өдрийн Фурье улирал динамикаар шинэчлэгдэнэ.")
+st.caption("Binary (0/1) шинжүүд автоматаар илрүүлэгдэнэ. **Сар / Өдөр** хоёр горим. Өдөр горимд 7 хоног/365–366 өдрийн Фурье улирал динамикаар шинэчлэгдэнэ.")
 
 def nonleaky(col: str) -> bool:
     s = str(col)
@@ -239,7 +228,7 @@ if agg_mode == "Өдөр":
         bb_k      = st.number_input("Bollinger σ (k)",    min_value=1.0, max_value=4.0, value=2.0, step=0.5)
         roc_win   = st.number_input("ROC/MOM цонх",       min_value=2, max_value=60, value=7, step=1)
         ta_show_chart = st.checkbox("TA график харуулах", value=True)
-        ta_dynamic_forecast = st.checkbox("Прогнозын үед TA-г динамикаар дахин тооцоолох", value=True)
+        ta_dynamic_forecast = st.checkbox("Прогнозын үед TA-г динамикаар дахин тооцоолох", value=False)
 
     ta_params = (int(sma_short), int(sma_long), int(ema_short), int(ema_long),
                  int(rsi_win), int(macd_sig), int(bb_win), float(bb_k), int(roc_win))
@@ -271,7 +260,6 @@ def build_monthly_cached(df_in: pd.DataFrame, feature_pool: list, n_lag: int):
     for i in range(1, n_lag+1):
         grouped[f"osol_lag_{i}"] = grouped["osol_count"].shift(i)
 
-    # ---- Year-ago & trailing features for MONTHLY mode (no leakage)
     s = grouped["osol_count"].astype(float)
     grouped["LY_12"]      = s.shift(12)
     grouped["ROLL12_SUM"] = s.rolling(12, min_periods=3).sum().shift(1)
@@ -365,7 +353,6 @@ def build_daily_cached(df_in: pd.DataFrame, feature_pool: list, n_lag: int,
     grouped = (pd.merge(daily_target, daily_features, on="date", how="left")
                .sort_values("date").reset_index(drop=True))
 
-    # Weekly + Yearly Fourier (year length aware)
     Kw, Ky = [1,2,3], [1]
     dow = grouped["date"].dt.dayofweek
     doy = grouped["date"].dt.dayofyear
@@ -390,17 +377,15 @@ def build_daily_cached(df_in: pd.DataFrame, feature_pool: list, n_lag: int,
     grouped["Year"] = grouped["date"].dt.year
     grouped["Month"] = grouped["date"].dt.month
 
-    # ---- Year-ago & trailing features for DAILY mode (no leakage)
     s = grouped["osol_count"].astype(float)
     grouped["LY_365"]  = s.shift(365)
     grouped["LY_366"]  = s.shift(366)
     grouped["LY_MEAN"] = grouped[["LY_365", "LY_366"]].mean(axis=1)
-
     grouped["ROLL365_SUM"]  = s.rolling(365, min_periods=30).sum().shift(1)
     grouped["ROLL365_MEAN"] = s.rolling(365, min_periods=30).mean().shift(1)
     grouped["ROLL30_SUM"]   = s.rolling(30,  min_periods=7).sum().shift(1)
 
-    # DOY-based previous-year alignment (handles leap years)
+    # DOY align (handle leap)
     doy_all = grouped["date"].dt.dayofyear
     doy_norm = np.where(doy_all == 366, 365, doy_all)
     grouped["DOY_NORM"] = doy_norm
@@ -408,7 +393,7 @@ def build_daily_cached(df_in: pd.DataFrame, feature_pool: list, n_lag: int,
     grouped["LY_DOY_1"] = grouped.groupby("DOY_NORM")["osol_count"].shift(1)
     grouped["LY_DOY_2"] = grouped.groupby("DOY_NORM")["osol_count"].shift(2)
     grouped["LY_DOY_MEAN_2"] = grouped[["LY_DOY_1","LY_DOY_2"]].mean(axis=1)
-    grouped = grouped.sort_values("date")  # restore chronological order
+    grouped = grouped.sort_values("date")
 
     exog_cols = feature_pool + fourier_cols + [
         "LY_365","LY_366","LY_MEAN",
@@ -416,7 +401,6 @@ def build_daily_cached(df_in: pd.DataFrame, feature_pool: list, n_lag: int,
         "LY_DOY_1","LY_DOY_2","LY_DOY_MEAN_2"
     ]
 
-    # TA индикаторууд
     if ta_params is not None:
         ta_df = compute_ta_cached(grouped["osol_count"], ta_params)
         grouped = pd.concat([grouped, ta_df], axis=1)
@@ -425,7 +409,7 @@ def build_daily_cached(df_in: pd.DataFrame, feature_pool: list, n_lag: int,
 
     return grouped, lag_cols, fourier_cols, exog_cols
 
-# sliders (these trigger rebuild when changed)
+# sliders (trigger rebuild)
 if agg_mode == "Сар":
     n_lag = st.sidebar.slider("Сарын лаг цонх (n_lag)", 6, 18, 12, 1, key="lag_m")
     grouped, lag_cols, seasonal_cols, exog_cols = build_monthly_cached(df, feature_pool, n_lag)
@@ -440,59 +424,86 @@ if grouped.empty or len(grouped) < max(10, n_lag + 5):
     st.warning(f"Сургалт хийхэд хангалттай өгөгдөл алга (lag={n_lag}, mode={agg_mode}). Он/сар/өдрийн хүрээг шалгана уу.")
     st.stop()
 
-# >>> ADD: цагийн трендийг заавал оруулах
+# Цагийн тренд
 grouped["T"]  = np.arange(len(grouped))
 grouped["T2"] = grouped["T"] ** 2
 exog_cols = list(dict.fromkeys(exog_cols + ["T", "T2"]))
 
 split_ratio = st.sidebar.slider("Train ratio", 0.5, 0.9, 0.8, 0.05)
 
-# -------------------------- Feature selection (cached) --------------------------
+# -------------------------- Leakage-safe feature grouping & quotas --------------------------
+ENDOG_NAMES = set(lag_cols) | {c for c in exog_cols if re.match(r"^(LY_|ROLL|LY_DOY_)", str(c))}
+SEASONAL = set(seasonal_cols)
+TREND = {"T", "T2"}
+TA_ALL = {c for c in exog_cols if str(c).startswith("TA_")}
+EXOG_PURE = (set(feature_pool) - SEASONAL) - TA_ALL
+
+with st.sidebar.expander("⚖️ Leakage-safe feature сонголтын квот", expanded=True):
+    max_endog_k = st.slider("ENDOG (lag/LY/ROLL/TA) дээд тоо", 4, 40, 14, 1)
+    min_exog_q  = st.slider("EXOG_PURE доод квот", 0, 30, 6, 1)
+    max_ta_k    = st.slider("TA_* дээд тоо", 0, 20, 5, 1)
+    use_pi_for_fs = st.checkbox("Test-д PI ашиглаж re-rank хийх", value=True)
+
 @st.cache_data(show_spinner=True)
-def select_top_exog_cached(grouped: pd.DataFrame, lag_cols: list, exog_cols: list, split_ratio: float, top_k: int = 14):
-    X_all_fs = grouped[lag_cols + exog_cols].fillna(0.0).values
-    y_all = grouped["osol_count"].values.reshape(-1, 1)
-    train_size = int(len(X_all_fs) * split_ratio)
-    X_train_fs, y_train_fs = X_all_fs[:train_size], y_all[:train_size].ravel()
-    try:
-        rf_fs = RandomForestRegressor(n_estimators=300, random_state=RANDOM_STATE, n_jobs=-1)
-        rf_fs.fit(X_train_fs, y_train_fs)
-        imp_series = pd.Series(rf_fs.feature_importances_, index=lag_cols + exog_cols)
-        k = min(top_k, len(exog_cols))
-        exog_top = imp_series.loc[exog_cols].sort_values(ascending=False).head(k).index.tolist()
-    except Exception:
-        exog_top = exog_cols[:min(top_k, len(exog_cols))]
-    return exog_top
+def rank_features_train(grouped: pd.DataFrame, all_cols: list[str], split_ratio: float):
+    X_all = grouped[all_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0).values
+    y_all = grouped["osol_count"].values
+    n_tr = int(len(X_all) * split_ratio)
+    rf = RandomForestRegressor(n_estimators=400, random_state=RANDOM_STATE, n_jobs=-1)
+    rf.fit(X_all[:n_tr], y_all[:n_tr])
+    return pd.Series(rf.feature_importances_, index=all_cols).sort_values(ascending=False)
 
-# TA-г дор хаяж N багтаах логик
-exog_top = select_top_exog_cached(grouped, lag_cols, exog_cols, split_ratio, top_k=top_k_exog)
-st.caption("Train дээр тодорсон top exogenous features (leakage-гүй):")
-st.write(exog_top)
+exog_pool_all = list((EXOG_PURE | TA_ALL | ENDOG_NAMES | SEASONAL | TREND))
+imp_series = rank_features_train(grouped, exog_pool_all, split_ratio)
 
+def pick_with_quota(imp: pd.Series):
+    chosen = []
+    chosen += list(SEASONAL | TREND)   # always include seasonal + trend
+    exog_rank = [c for c in imp.index if c in EXOG_PURE]
+    chosen += exog_rank[:min_exog_q]
+    ta_rank = [c for c in imp.index if c in TA_ALL]
+    chosen += ta_rank[:max_ta_k]
+    endog_rank = [c for c in imp.index if c in ENDOG_NAMES]
+    room = max(0, max_endog_k - len(set(chosen) & ENDOG_NAMES))
+    chosen += endog_rank[:room]
+    chosen = list(dict.fromkeys(chosen))
+    if len(chosen) < top_k_exog:
+        fill = [c for c in imp.index if c not in chosen]
+        chosen += fill[:(top_k_exog - len(chosen))]
+    return list(dict.fromkeys(chosen))
+
+exog_top = pick_with_quota(imp_series)
+
+def permutation_rank_on_test(df: pd.DataFrame, cols: list[str], split_ratio: float):
+    X = df[cols].replace([np.inf, -np.inf], np.nan).fillna(0.0).values
+    y = df["osol_count"].values
+    n = len(X); n_tr = int(n*split_ratio)
+    model = RandomForestRegressor(n_estimators=300, random_state=RANDOM_STATE, n_jobs=-1)
+    model.fit(X[:n_tr], y[:n_tr])
+    pi = permutation_importance(model, X[n_tr:], y[n_tr:], n_repeats=20,
+                                random_state=RANDOM_STATE, scoring="neg_root_mean_squared_error", n_jobs=-1)
+    order = pd.Series(pi.importances_mean, index=cols).sort_values(ascending=False).index.tolist()
+    return order
+
+if use_pi_for_fs and len(exog_top) > 0:
+    pi_order = permutation_rank_on_test(grouped, exog_top, split_ratio)
+    exog_top = pick_with_quota(pd.Series(range(len(pi_order), 0, -1), index=pi_order))
+
+# TA-г дор хаяж N багтаах
 ta_cols_all = [c for c in exog_cols if c.startswith("TA_")]
 if ta_use and ta_force_min > 0:
     must_have_ta = [c for c in ta_cols_all if c not in exog_top][:ta_force_min]
-    exog_top = list(dict.fromkeys(exog_top + must_have_ta))  # давхардалгүй union
+    exog_top = list(dict.fromkeys(exog_top + must_have_ta))
 
-# Year-ago & rolling features-ийг дор хаяж үндсэн хэсгийг хүчээр багтаая
-force_ly = [c for c in [
-    "LY_365","LY_366","LY_MEAN","ROLL365_SUM","ROLL365_MEAN",  # өдөр горимын гол
-    "LY_DOY_1","LY_DOY_2","LY_DOY_MEAN_2",
-    "LY_12","ROLL12_SUM"  # сар горимын гол
-] if c in exog_cols and c not in exog_top]
-exog_top = list(dict.fromkeys(exog_top + force_ly))
+# FORCE-IN: Fourier улирал + цагийн тренд
+exog_top = list(dict.fromkeys(list(SEASONAL) + ["T","T2"] + exog_top))
+feature_cols = list(dict.fromkeys(lag_cols + exog_top))
 
-# >>> FORCE-IN: Fourier улирал + цагийн тренд + LY/ROLL
-exog_top = list(dict.fromkeys(seasonal_cols + ["T","T2"] + exog_top))
-
-feature_cols = lag_cols + exog_top
-if ta_use and not any(c.startswith("TA_") for c in exog_top):
-    st.warning("TA асаалттай боловч feature selection TA-г хассан байна (exog_top-д TA_* алга). "
-               "k-г өсгөх эсвэл N-г нэмнэ үү.")
+st.caption("Leakage-safe сонгогдсон features:")
+st.write(feature_cols)
 
 # -------------------------- Make matrices --------------------------
 X = grouped[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0).values
-
 y = grouped["osol_count"].values.reshape(-1, 1)
 train_size = int(len(X) * split_ratio)
 X_train, X_test = X[:train_size], X[train_size:]
@@ -502,25 +513,37 @@ scaler_X = MinMaxScaler()
 X_train_s = scaler_X.fit_transform(X_train)
 X_test_s  = scaler_X.transform(X_test)
 
-# log1p/expm1 scale (count data-д илүү зөөлөн)
-scaler_y = FunctionTransformer(np.log1p, inverse_func=np.expm1, validate=False)
-y_train_s = scaler_y.fit_transform(y_train).ravel()
-y_test_s  = scaler_y.transform(y_test).ravel()
+# y scaling/loss options
+with st.sidebar.expander("🎚 Target scaling/loss", expanded=True):
+    y_transform_mode = st.selectbox("y трансформаци", ["auto", "log1p", "identity"], index=0)
+    use_tweedie = st.checkbox("TweedieRegressor (power=1.5)", value=False)
+
+def make_y_transformer(model_name_hint: str):
+    if y_transform_mode == "identity":
+        return FunctionTransformer(lambda x: x, inverse_func=lambda x: x, validate=False)
+    if y_transform_mode == "log1p":
+        return FunctionTransformer(np.log1p, inverse_func=np.expm1, validate=False)
+    # auto: Poisson/Tweedie => identity, бусад нь log1p
+    if ("Poisson" in model_name_hint) or use_tweedie:
+        return FunctionTransformer(lambda x: x, inverse_func=lambda x: x, validate=False)
+    return FunctionTransformer(np.log1p, inverse_func=np.expm1, validate=False)
 
 identicals = [c for c in feature_cols if np.allclose(grouped[c].values, grouped["osol_count"].values, equal_nan=False)]
 if identicals:
     st.error(f"IDENTICAL leakage үлдлээ: {identicals}")
     st.stop()
 corrs = grouped[feature_cols].corrwith(grouped["osol_count"])
-st.write("Target-тэй корреляци (дээд 10):", corrs.head(10))
+st.write("Target-тэй корреляци (дээд 10):", corrs.sort_values(ascending=False).head(10))
 
 # -------------------------- Model zoo --------------------------
-estimators = [
+estimators_stack = [
     ("rf", RandomForestRegressor(n_estimators=200, random_state=RANDOM_STATE, n_jobs=-1)),
     ("ridge", Ridge()),
     ("dt", DecisionTreeRegressor(random_state=RANDOM_STATE)),
 ]
 MODEL_LIST = [
+    ("HistGB-Poisson", HistGradientBoostingRegressor(loss="poisson", learning_rate=0.06, max_depth=None, random_state=RANDOM_STATE)),
+    ("TweedieRegressor", TweedieRegressor(power=1.5, alpha=0.0, link="log", max_iter=3000)),
     ("LinearRegression", LinearRegression()),
     ("Ridge", Ridge()),
     ("Lasso", Lasso()),
@@ -529,12 +552,11 @@ MODEL_LIST = [
     ("RandomForest", RandomForestRegressor(random_state=RANDOM_STATE, n_jobs=-1)),
     ("ExtraTrees", ExtraTreesRegressor(random_state=RANDOM_STATE, n_jobs=-1)),
     ("GradientBoosting", GradientBoostingRegressor(random_state=RANDOM_STATE)),
-    ("HistGB-Poisson", HistGradientBoostingRegressor(loss="poisson", learning_rate=0.06, max_depth=None, random_state=RANDOM_STATE)),
     ("AdaBoost", AdaBoostRegressor(random_state=RANDOM_STATE)),
     ("KNeighbors", KNeighborsRegressor()),
     ("SVR", SVR()),
     ("MLPRegressor", MLPRegressor(hidden_layer_sizes=(64, 32), max_iter=800, random_state=RANDOM_STATE)),
-    ("Stacking", StackingRegressor(estimators=estimators, final_estimator=LinearRegression(), cv=5)),
+    ("Stacking", StackingRegressor(estimators=estimators_stack, final_estimator=LinearRegression(), cv=5)),
 ]
 if XGBRegressor is not None:
     MODEL_LIST.append(("XGBRegressor", XGBRegressor(tree_method="hist", predictor="cpu_predictor", random_state=RANDOM_STATE, n_estimators=400)))
@@ -561,35 +583,36 @@ voting_estimators += [
 if len(voting_estimators) > 1:
     MODEL_LIST.append(("VotingRegressor", VotingRegressor(estimators=voting_estimators)))
 
-stacking_estimators = [("rf", RandomForestRegressor(random_state=RANDOM_STATE, n_jobs=-1))]
+stacking_estimators_more = [("rf", RandomForestRegressor(random_state=RANDOM_STATE, n_jobs=-1))]
 if XGBRegressor is not None:
-    stacking_estimators.append(("xgb", XGBRegressor(tree_method="hist", predictor="cpu_predictor", random_state=RANDOM_STATE)))
+    stacking_estimators_more.append(("xgb", XGBRegressor(tree_method="hist", predictor="cpu_predictor", random_state=RANDOM_STATE)))
 if LGBMRegressor is not None:
-    stacking_estimators.append(("lgbm", LGBMRegressor(device="cpu", random_state=RANDOM_STATE)))
+    stacking_estimators_more.append(("lgbm", LGBMRegressor(device="cpu", random_state=RANDOM_STATE)))
 if CatBoostRegressor is not None:
-    stacking_estimators.append(("cat", CatBoostRegressor(task_type="CPU", verbose=0, random_state=RANDOM_STATE)))
-MODEL_LIST.append(("StackingEnsemble", StackingRegressor(estimators=stacking_estimators, final_estimator=LinearRegression(), cv=5)))
+    stacking_estimators_more.append(("cat", CatBoostRegressor(task_type="CPU", verbose=0, random_state=RANDOM_STATE)))
+MODEL_LIST.append(("StackingEnsemble", StackingRegressor(estimators=stacking_estimators_more, final_estimator=LinearRegression(), cv=5)))
 
-# -------------------------- Train all (CACHED) --------------------------
+# -------------------------- TRAIN (cached) each with its own y-transform --------------------------
 @st.cache_resource(show_spinner=True)
 def train_all_models_cached(
-    X_train_s, y_train_s, X_test_s, y_test_s,
-    _scaler_y, _model_list,   # ⬅️ unhashable аргументуудыг _-тай нэрлэв
-    cache_signature: str
+    X_train_s, y_train, X_test_s, y_test,
+    _model_list, cache_signature: str
 ):
-    results, y_preds_s, fitted_models = [], {}, {}
-
+    results, y_preds_inv, fitted_models = [], {}, {}
     for name, model in _model_list:
         try:
-            model.fit(X_train_s, y_train_s)
-            fitted_models[name] = model
+            scaler_y_local = make_y_transformer(name)
+            y_tr_s = scaler_y_local.fit_transform(y_train.reshape(-1,1)).ravel()
+            y_te_s = scaler_y_local.transform(y_test.reshape(-1,1)).ravel()
+
+            model.fit(X_train_s, y_tr_s)
+            fitted_models[name] = (model, scaler_y_local)
 
             y_pred_s = np.asarray(model.predict(X_test_s)).reshape(-1)
-            y_preds_s[name] = y_pred_s
-            r2_s = r2_score(y_test_s, y_pred_s)
+            r2_s = r2_score(y_te_s, y_pred_s)
 
-            y_true = _scaler_y.inverse_transform(y_test_s.reshape(-1, 1)).ravel()
-            y_pred = _scaler_y.inverse_transform(y_pred_s.reshape(-1, 1)).ravel()
+            y_true = scaler_y_local.inverse_transform(y_te_s.reshape(-1, 1)).ravel()
+            y_pred = scaler_y_local.inverse_transform(y_pred_s.reshape(-1, 1)).ravel()
             y_pred = np.clip(y_pred, 0, None)
 
             results.append({
@@ -598,6 +621,7 @@ def train_all_models_cached(
                 "RMSE (real)": float(np.sqrt(mean_squared_error(y_true, y_pred))),
                 "R2 (scaled)": float(r2_s),
             })
+            y_preds_inv[name] = y_pred
         except Exception as e:
             results.append({
                 "Model": name,
@@ -606,21 +630,19 @@ def train_all_models_cached(
                 "R2 (scaled)": np.nan,
                 "Error": str(e),
             })
-
     results_df = pd.DataFrame(results).sort_values("RMSE (real)", na_position="last")
-    return fitted_models, results_df, y_preds_s
+    return fitted_models, results_df, y_preds_inv
 
 sig_parts = {
     "mode": agg_mode, "n_lag": n_lag, "split": round(float(split_ratio), 4),
-    "cols": tuple(feature_cols), "ver": "r3.5-ly",
-    "nrows": int(len(grouped))
+    "cols": tuple(feature_cols), "ver": "r4.0",
+    "nrows": int(len(grouped)), "ytrans": y_transform_mode, "tweedie": use_tweedie,
 }
 cache_signature = json.dumps(sig_parts, sort_keys=True)
 
 with st.spinner("ML моделийг сургаж байна (эхний удаад л)…"):
-    fitted_models, results_df, y_preds_s = train_all_models_cached(
-        X_train_s, y_train_s, X_test_s, y_test_s,
-        scaler_y, MODEL_LIST, cache_signature
+    fitted_models, results_df, y_preds_inv = train_all_models_cached(
+        X_train_s, y_train, X_test_s, y_test, MODEL_LIST, cache_signature
     )
 
 st.success("Моделүүд бэлэн! (дараагийн сонголтууд дээр дахин сургахгүй)")
@@ -636,16 +658,16 @@ except Exception:
 
 # -------------------------- Permutation Importance --------------------------
 with st.expander("🔍 Permutation importance (test)", expanded=False):
-    pi_model_name = st.selectbox("PI тооцох модель",
-                                 list(fitted_models.keys()),
-                                 index=list(fitted_models.keys()).index(best_model_name))
-    scoring_opt = st.selectbox("Scoring (test дээр)", 
+    pi_model_name = st.selectbox(
+        "PI тооцох модель", list(fitted_models.keys()),
+        index=list(fitted_models.keys()).index(best_model_name) if best_model_name in fitted_models else 0)
+    scoring_opt = st.selectbox("Scoring (test дээр)",
                                ["r2", "neg_mean_absolute_error", "neg_root_mean_squared_error"], index=1)
     n_repeats = st.slider("n_repeats", 5, 50, 20, 1)
-    est = fitted_models[pi_model_name]
+    est, scaler_y_pi = fitted_models[pi_model_name]
 
     X_te_safe = np.nan_to_num(X_test_s, nan=0.0, posinf=0.0, neginf=0.0)
-    y_te_safe = y_test_s
+    y_te_safe = scaler_y_pi.transform(y_test).ravel()
 
     pi = permutation_importance(est, X_te_safe, y_te_safe,
                                 n_repeats=n_repeats, random_state=RANDOM_STATE,
@@ -673,8 +695,6 @@ with st.expander("🔍 Permutation importance (test)", expanded=False):
     st.plotly_chart(fig_pi, use_container_width=True)
 
 # -------------------------- Forecast helpers --------------------------
-lag_count = len(lag_cols)
-
 def seasonal_values_for_date(dt: pd.Timestamp, mode: str):
     vals = {}
     if mode == "Сар":
@@ -698,149 +718,215 @@ def seasonal_values_for_date(dt: pd.Timestamp, mode: str):
 def step_next_date(d: pd.Timestamp, mode: str):
     return (d + (pd.offsets.MonthBegin(1) if mode == "Сар" else pd.Timedelta(days=1))).normalize()
 
-def forecast_next(model, last_raw_row, steps, last_date, mode,
-                  seasonal_cols, feature_cols, scaler_X, scaler_y,
-                  ta_dynamic=False, ta_params=None, hist_series=None,
-                  resid_bias=0.0, bias_decay=0.85, alpha_snv=0.25, m_snaive=7,
-                  soft_clip=True):
+def season_key(ts: pd.Timestamp, mode: str):
+    return int(ts.month) if mode=="Сар" else int(ts.dayofweek)
 
-    preds = []
-    lag_vals = last_raw_row[:lag_count].astype(float).copy()
+def residual_profiles(test_dates, y_true, y_pred, mode: str):
+    df_r = pd.DataFrame({"date": pd.to_datetime(test_dates), "y": y_true, "yhat": y_pred})
+    df_r["key"] = df_r["date"].apply(lambda d: season_key(d, mode))
+    df_r["resid"] = df_r["y"] - df_r["yhat"]
+    prof = df_r.groupby("key")["resid"].agg(["median","std"]).to_dict(orient="index")
+    qmap = df_r.groupby("key")["resid"].quantile([0.10,0.90]).unstack()
+    # fill dict with all keys to avoid KeyErrors
+    keys_all = range(1,13) if mode=="Сар" else range(0,7)
+    qdict = {int(k): {"q10": float(qmap.loc[k,0.10]) if (k in qmap.index) else 0.0,
+                      "q90": float(qmap.loc[k,0.90]) if (k in qmap.index) else 0.0}
+             for k in keys_all}
+    return prof, qdict, float(df_r["resid"].std())
 
-    # Бусад exog эхний утгууд
-    other_idx = {name: lag_count + i for i, name in enumerate(feature_cols[lag_count:])}
-    other_exog_names = [c for c in feature_cols[lag_count:] if c not in seasonal_cols]
+def forecast_next_recursive(model, scaler_y_local, last_raw_row, steps, last_date, mode,
+                            seasonal_cols, feature_cols, scaler_X,
+                            ta_dynamic=False, ta_params=None, hist_series=None,
+                            bias_profile=None, global_std=0.0, halflife=12,
+                            alpha_snv=0.20, m_snaive=7, soft_clip=True,
+                            qdict=None):
+    preds, lo, hi = [], [], []
+    lag_count_loc = len([c for c in feature_cols if c.startswith("osol_lag_")])
+    lag_vals = last_raw_row[:lag_count_loc].astype(float).copy()
+    other_idx = {name: lag_count_loc + i for i, name in enumerate(feature_cols[lag_count_loc:])}
+    other_exog_names = [c for c in feature_cols[lag_count_loc:] if c not in seasonal_cols]
     other_exog_vals = {n: float(last_raw_row[other_idx[n]]) for n in other_exog_names if n in other_idx}
-
-    # Trend суурь
     base_T = float(other_exog_vals.get("T", 0.0))
-
-    # TA / series
-    ta_cols_present = [c for c in other_exog_names if c.startswith("TA_")]
     series = list(map(float, hist_series)) if hist_series is not None else []
     cur_date = pd.to_datetime(last_date)
 
     for t in range(1, steps+1):
         cur_date = step_next_date(cur_date, mode)
         seas = seasonal_values_for_date(cur_date, mode)
-
         exog_vector = []
-        for name in feature_cols[lag_count:]:
+        for name in feature_cols[lag_count_loc:]:
             if name in seasonal_cols:
                 exog_vector.append(seas.get(name, 0.0))
-
             elif name == "T":
                 exog_vector.append(base_T + t)
             elif name == "T2":
-                tt = base_T + t
-                exog_vector.append(tt * tt)
-
+                tt = base_T + t; exog_vector.append(tt*tt)
             elif name.startswith("TA_") and ta_dynamic and ta_params is not None:
                 s_tmp = pd.Series(series, dtype=float)
                 ta_last = compute_ta_cached(s_tmp, ta_params).iloc[-1]
                 exog_vector.append(float(ta_last.get(name, 0.0)))
-
-            elif name in {"LY_365","LY_366","LY_MEAN","ROLL365_SUM","ROLL365_MEAN","ROLL30_SUM",
-                          "LY_DOY_1","LY_DOY_2","LY_DOY_MEAN_2","LY_12","ROLL12_SUM"}:
+            elif re.match(r"^(LY_|ROLL|LY_DOY_)", name):
                 def safe_tail(arr, k): return float(arr[-k]) if len(arr) >= k else float("nan")
                 if mode == "Өдөр":
-                    if name == "LY_365":      val = safe_tail(series, 365)
-                    elif name == "LY_366":    val = safe_tail(series, 366)
-                    elif name == "LY_MEAN":   val = np.nanmean([safe_tail(series,365), safe_tail(series,366)])
-                    elif name == "ROLL365_SUM":  val = float(np.nansum(series[-365:])) if len(series) else float("nan")
-                    elif name == "ROLL365_MEAN": val = float(np.nanmean(series[-365:])) if len(series) else float("nan")
-                    elif name == "ROLL30_SUM":   val = float(np.nansum(series[-30:]))  if len(series) else float("nan")
+                    if name == "LY_365": val = safe_tail(series,365)
+                    elif name == "LY_366": val = safe_tail(series,366)
+                    elif name == "LY_MEAN": val = np.nanmean([safe_tail(series,365), safe_tail(series,366)])
+                    elif name == "ROLL365_SUM":  val = float(np.nansum(series[-365:])) if len(series) else np.nan
+                    elif name == "ROLL365_MEAN": val = float(np.nanmean(series[-365:])) if len(series) else np.nan
+                    elif name == "ROLL30_SUM":   val = float(np.nansum(series[-30:]))  if len(series) else np.nan
                     elif name in {"LY_DOY_1","LY_DOY_2","LY_DOY_MEAN_2"}:
-                        ly1 = np.nanmean([safe_tail(series,365), safe_tail(series,366)])
+                        ly1 = safe_tail(series,365)
                         ly2 = np.nanmean([safe_tail(series,730), safe_tail(series,731), safe_tail(series,732)])
                         val = ly1 if name=="LY_DOY_1" else ly2 if name=="LY_DOY_2" else np.nanmean([ly1, ly2])
                 else:
-                    if name == "LY_12":        val = safe_tail(series, 12)
-                    elif name == "ROLL12_SUM": val = float(np.nansum(series[-12:])) if len(series) else float("nan")
+                    if name == "LY_12":        val = safe_tail(series,12)
+                    elif name == "ROLL12_SUM": val = float(np.nansum(series[-12:])) if len(series) else np.nan
                 exog_vector.append(val)
             else:
                 exog_vector.append(other_exog_vals.get(name, 0.0))
 
         seq_raw = np.concatenate([lag_vals, np.array(exog_vector, float)]).reshape(1, -1)
-        seq_raw = np.nan_to_num(seq_raw, nan=0.0, posinf=0.0, neginf=0.0)
-        seq_scaled = scaler_X.transform(seq_raw)
+        seq_scaled = scaler_X.transform(np.nan_to_num(seq_raw, nan=0.0, posinf=0.0, neginf=0.0))
 
         p_scaled = float(np.asarray(model.predict(seq_scaled)).ravel()[0])
-        p = float(scaler_y.inverse_transform(np.array([[p_scaled]])).ravel()[0])
-        if not np.isfinite(p): p = 0.0
+        p = float(scaler_y_local.inverse_transform(np.array([[p_scaled]])).ravel()[0])
         p = max(p, 0.0)
 
-        # Seasonal naive
         p_snaive = float(series[-m_snaive]) if len(series) >= m_snaive else (series[-1] if len(series) else p)
+        key = season_key(cur_date, mode)
+        med_bias = (bias_profile.get(key, {}).get("median", 0.0) if bias_profile else 0.0)
+        w = np.exp(- (t-1) / max(1e-6, float(halflife)))
+        p_adj = (1 - alpha_snv) * p + alpha_snv * p_snaive + w * med_bias
 
-        # Residual debias + blend
-        bias_t = resid_bias * (bias_decay ** (t-1))
-        p = (1 - alpha_snv) * p + alpha_snv * p_snaive + bias_t
+        q10 = (qdict.get(key, {}).get("q10", -1.0*global_std) if qdict else -1.0*global_std)
+        q90 = (qdict.get(key, {}).get("q90",  1.0*global_std) if qdict else  1.0*global_std)
+        lo_t = max(0.0, p_adj + w*q10); hi_t = max(p_adj, p_adj + w*q90)
 
-        # Soft-clip (optional)
-        if soft_clip and len(series) >= 20:
-            lo = float(np.nanquantile(series, 0.01))
-            hi = float(np.nanquantile(series, 0.99) * 1.2)
-            p = float(np.clip(p, max(0.0, lo*0.5), hi))
+        if soft_clip and len(series) >= max(20, m_snaive):
+            lo_hist = float(np.nanquantile(series, 0.01))
+            hi_hist = float(np.nanquantile(series, 0.99) * 1.3)
+            p_adj = float(np.clip(p_adj, max(0.0, lo_hist*0.4), hi_hist))
+            lo_t = max(0.0, min(lo_t, p_adj)); hi_t = max(p_adj, min(hi_t, hi_hist))
 
-        preds.append(p)
+        preds.append(p_adj); lo.append(lo_t); hi.append(hi_t)
+        lag_vals = np.roll(lag_vals, 1); lag_vals[0] = p_adj
+        series.append(p_adj)
 
-        # update lags & series
-        lag_vals = np.roll(lag_vals, 1); lag_vals[0] = p
-        series.append(p)
+    return np.array(preds), np.array(lo), np.array(hi)
 
-    return np.array(preds)
-
-# -------------------------- Build test/future tables --------------------------
+# -------------------------- Build test table --------------------------
 test_dates = grouped["date"].iloc[-len(X_test):].values
-test_true  = scaler_y.inverse_transform(y_test_s.reshape(-1, 1)).flatten()
+test_true  = y_test.flatten()
 test_preds_df = pd.DataFrame({"date": test_dates, "real": test_true})
-for name, yps in y_preds_s.items():
-    ypi = scaler_y.inverse_transform(np.array(yps).reshape(-1, 1)).flatten()
-    test_preds_df[name] = np.clip(ypi, 0, None)
+for name, yhat in y_preds_inv.items():
+    test_preds_df[name] = np.clip(np.asarray(yhat).ravel(), 0, None)
 
-# SAFE int columns (nullable)
 for col in list(test_preds_df.columns)[2:]:
     test_preds_df[col + "_int"] = to_int_safe(test_preds_df[col])
 
-# ------------------ Калибровк/холимог UI ------------------
-unit_label = "сар" if agg_mode == "Сар" else "өдөр"
-with st.sidebar.expander("Прогнозын калибровк/холимог", expanded=True):
-    resid_win  = st.slider(f"Калибровкын цонх W ({unit_label})",
-                           1 if agg_mode=="Сар" else 7,
-                           12 if agg_mode=="Сар" else 60,
-                           2 if agg_mode=="Сар" else 14, 1)
-    bias_decay = st.slider("Bias decay (0..1)", 0.0, 1.0, 0.85, 0.05)
-    alpha_snv  = st.slider("sNaive холих жин α", 0.0, 1.0, 0.10, 0.05)
-    use_soft_clip = st.checkbox("Soft-clip идэвхжүүлэх", value=False)
+# ------------------ Пост-процесс (seasonal bias profile + intervals) ------------------
+best_model, best_scaler_y = fitted_models[best_model_name]
+prof_dict, q_dict, resid_std_global = residual_profiles(
+    test_preds_df["date"].values, test_preds_df["real"].values, test_preds_df[best_model_name].values, agg_mode
+)
+with st.sidebar.expander("Прогнозын калибровк/пост-процесс", expanded=True):
+    halflife = st.slider(f"Bias decay halflife ({'сар' if agg_mode=='Сар' else 'өдөр'})",
+                         1 if agg_mode=='Сар' else 7, 24 if agg_mode=='Сар' else 90,
+                         6 if agg_mode=='Сар' else 21, 1)
+    alpha_snv  = st.slider("Seasonal naive холих жин α", 0.0, 1.0, 0.20, 0.05)
+    use_soft_clip = st.checkbox("Soft-clip идэвхжүүлэх", value=True)
 
-W = int(min(resid_win, len(test_preds_df)))
-bias_by_model = {m: float((test_preds_df["real"].tail(W) - test_preds_df[m].tail(W)).mean())
-                 for m in fitted_models.keys()}
+# -------------------------- Прогноз стратеги сонголт --------------------------
+forecast_strategy = st.sidebar.selectbox("Прогнозын стратеги",
+    ["Recursive (AR)", "Direct multi-step (no recursion)"], index=0)
 
+# -------------------------- Future dates --------------------------
 last_row_raw = grouped[feature_cols].iloc[-1].values
 last_known_date = grouped["date"].iloc[-1]
-
 future_steps = 12 if agg_mode == "Сар" else 365
 future_dates = pd.date_range(start=step_next_date(last_known_date, agg_mode), periods=future_steps, freq=freq_code)
 future_preds_df = pd.DataFrame({"date": future_dates})
-for name, model in fitted_models.items():
+
+# ---- Recursive forecasts for all models (+interval for best) ----
+for name, (model, scaler_y_local) in fitted_models.items():
     m_snaive = 12 if agg_mode=="Сар" else 7
-    future_preds_df[name] = forecast_next(
-        model, last_row_raw, future_steps, last_known_date, agg_mode,
-        seasonal_cols, feature_cols, scaler_X, scaler_y,
+    preds, lo, hi = forecast_next_recursive(
+        model, scaler_y_local, last_row_raw, future_steps, last_known_date, agg_mode,
+        seasonal_cols, feature_cols, scaler_X,
         ta_dynamic=(agg_mode=="Өдөр" and ta_dynamic_forecast),
         ta_params=ta_params,
         hist_series=grouped["osol_count"].values,
-        resid_bias=bias_by_model.get(name, 0.0),
-        bias_decay=bias_decay, alpha_snv=alpha_snv, m_snaive=m_snaive,
-        soft_clip=use_soft_clip
+        bias_profile=prof_dict, global_std=resid_std_global, halflife=halflife,
+        alpha_snv=alpha_snv, m_snaive=m_snaive, soft_clip=use_soft_clip,
+        qdict=q_dict
     )
+    future_preds_df[name] = np.clip(preds, 0, None)
+    if name == best_model_name:
+        future_preds_df[f"{name}_lo"] = np.clip(lo, 0, None)
+        future_preds_df[f"{name}_hi"] = np.clip(hi, 0, None)
 
-for col in list(future_preds_df.columns)[1:]:
-    future_preds_df[col] = np.clip(future_preds_df[col], 0, None)
+# ---- Direct multi-step (optional) ----
+def build_direct_dataset(grouped: pd.DataFrame, H: int, mode: str, use_exog_pure: bool=True):
+    cols = list(SEASONAL | TREND)
+    if use_exog_pure:
+        cols += sorted(list(EXOG_PURE & set(grouped.columns)))
+    X_exog = grouped[cols].replace([np.inf, -np.inf], np.nan).fillna(0.0).values
+    yv = grouped["osol_count"].values
+    n = len(yv); M = n - H
+    if M <= 0:
+        return None, None, None, cols
+    Xd = X_exog[:M, :]
+    Yd = np.column_stack([yv[h:(h+M)] for h in range(1, H+1)])
+    dates_feat = grouped["date"].values[:M]
+    return Xd, Yd, dates_feat, cols
+
+@st.cache_resource(show_spinner=True)
+def train_direct_multioutput(Xd, Yd, base_name="HistGB-Poisson"):
+    if base_name == "HistGB-Poisson":
+        base = HistGradientBoostingRegressor(loss="poisson", random_state=RANDOM_STATE)
+    else:
+        base = GradientBoostingRegressor(random_state=RANDOM_STATE)
+    return MultiOutputRegressor(base).fit(Xd, Yd)
+
+def future_exog_matrix(future_dates, cols_direct):
+    df_tmp = pd.DataFrame({"date": future_dates})
+    # trend
+    df_tmp["T"] = np.arange(len(grouped), len(grouped)+len(future_dates))
+    df_tmp["T2"] = df_tmp["T"]**2
+    # seasonal
+    if agg_mode=="Сар":
+        m = df_tmp["date"].dt.month
+        for k in [1,2,3]:
+            df_tmp[f"m_sin_{k}"] = np.sin(2*np.pi*k*m/12); df_tmp[f"m_cos_{k}"] = np.cos(2*np.pi*k*m/12)
+    else:
+        dow = df_tmp["date"].dt.dayofweek; doy = df_tmp["date"].dt.dayofyear
+        year_len = np.where(df_tmp["date"].dt.is_leap_year, 366, 365)
+        for k in [1,2,3]:
+            df_tmp[f"w_sin_{k}"] = np.sin(2*np.pi*k*dow/7); df_tmp[f"w_cos_{k}"] = np.cos(2*np.pi*k*dow/7)
+        for k in [1]:
+            df_tmp[f"y_sin_{k}"] = np.sin(2*np.pi*k*doy/year_len); df_tmp[f"y_cos_{k}"] = np.cos(2*np.pi*k*doy/year_len)
+    # EXOG_PURE (if present in cols_direct)
+    for c in (EXOG_PURE & set(grouped.columns)):
+        if c not in df_tmp.columns and c in cols_direct:
+            df_tmp[c] = float(grouped[c].iloc[-1])  # last known level (static)
+    return df_tmp[cols_direct].replace([np.inf, -np.inf], np.nan).fillna(0.0).values
+
+if forecast_strategy == "Direct multi-step (no recursion)":
+    H_direct = 12 if agg_mode=="Сар" else 90
+    Xd, Yd, _, cols_direct = build_direct_dataset(grouped, H_direct, agg_mode, use_exog_pure=True)
+    if Xd is not None:
+        with st.spinner("Direct multi-step (multioutput) сургаж байна…"):
+            mo_model = train_direct_multioutput(Xd, Yd, base_name="HistGB-Poisson")
+        Xf = future_exog_matrix(future_dates[:H_direct], cols_direct)
+        Yf = mo_model.predict(Xf)  # shape [H_direct, H_direct]
+        future_preds_df["DirectMS"] = 0.0
+        future_preds_df.loc[:H_direct-1, "DirectMS"] = np.clip(np.diag(Yf), 0, None)
+
+# SAFE int columns (nullable)
+for col in [c for c in list(future_preds_df.columns) if c != "date"]:
     future_preds_df[col + "_int"] = to_int_safe(future_preds_df[col])
 
+# -------------------------- Export --------------------------
 with pd.ExcelWriter("model_predictions.xlsx", engine="xlsxwriter") as writer:
     test_preds_df.to_excel(writer, index=False, sheet_name="Test_Predictions")
     future_preds_df.to_excel(writer, index=False, sheet_name="Future_Predictions")
@@ -855,8 +941,8 @@ st.dataframe(test_preds_df.head(10000), use_container_width=True)
 st.subheader(("Ирээдүйн 12 САР" if agg_mode == "Сар" else "Ирээдүйн 365 ӨДӨР") + " — прогноз (модел бүрээр)")
 st.dataframe(future_preds_df, use_container_width=True)
 
-# -------------------------- Graph UI (slice only; no recompute) --------------------------
-model_options = list(fitted_models.keys())
+# -------------------------- Graph UI --------------------------
+model_options = list(fitted_models.keys()) + (["DirectMS"] if "DirectMS" in future_preds_df.columns else [])
 if len(model_options) == 0:
     st.warning("Прогноз харах модел олдсонгүй.")
 else:
@@ -871,7 +957,6 @@ else:
     steps = h_map[selected_h]
 
     view_df = future_preds_df[["date", selected_model]].iloc[:steps].rename(columns={selected_model: "forecast"})
-
     y_col = "forecast"
     if agg_mode == "Өдөр":
         smooth_win = st.sidebar.slider("Гөлгөршүүлэх цонх (өдөр)", 1, 21, 7, 1)
@@ -881,6 +966,14 @@ else:
 
     fig = px.line(view_df, x="date", y=y_col, markers=True,
                   title=f"{selected_model} — {selected_h} ({'сар' if agg_mode=='Сар' else 'өдөр'}ийн шагналт)")
+    # interval band (best model)
+    if f"{selected_model}_lo" in future_preds_df.columns and f"{selected_model}_hi" in future_preds_df.columns:
+        band = future_preds_df[["date", f"{selected_model}_lo", f"{selected_model}_hi"]].iloc[:steps]
+        fig.add_traces([
+            go.Scatter(x=band["date"], y=band[f"{selected_model}_lo"], mode="lines", line=dict(width=0), showlegend=False),
+            go.Scatter(x=band["date"], y=band[f"{selected_model}_hi"], mode="lines", line=dict(width=0),
+                       fill="tonexty", name="Interval")
+        ])
     st.plotly_chart(fig, use_container_width=True)
 
 # Олон модель график
@@ -891,32 +984,31 @@ with st.expander("Ирээдүйн 365 өдөр — график (олон мо�
                           title="Ирээдүйн 365 өдөр — олон моделиор")
         st.plotly_chart(fig_all, use_container_width=True)
 
-# -------------------------- Horizon metrics (no retrain) --------------------------
-def horizon_scores(model, X_full_s, y_full_s, scaler_y, horizons):
+# -------------------------- Horizon metrics --------------------------
+def horizon_scores(model, scaler_y_local, X_te_s, y_te, horizons):
     out = {}
-    y_true_full = scaler_y.inverse_transform(y_full_s.reshape(-1,1)).ravel()
     for h in horizons:
-        if len(X_full_s) < h + 1:
+        if len(X_te_s) < h:
             out[h] = np.nan; continue
-        X_te = X_full_s[-h:]
-        yhat_s = np.asarray(model.predict(X_te)).ravel()
-        yhat   = scaler_y.inverse_transform(yhat_s.reshape(-1,1)).ravel()
+        yhat_s = np.asarray(model.predict(X_te_s[-h:])).ravel()
+        yhat   = scaler_y_local.inverse_transform(yhat_s.reshape(-1,1)).ravel()
         yhat = np.clip(yhat, 0, None)
-        out[h] = {"MAE": mean_absolute_error(y_true_full[-h:], yhat),
-                  "RMSE": float(np.sqrt(mean_squared_error(y_true_full[-h:], yhat)))}
+        out[h] = {"MAE": mean_absolute_error(y_te[-h:].ravel(), yhat),
+                  "RMSE": float(np.sqrt(mean_squared_error(y_te[-h:].ravel(), yhat)))}
     return out
 
-if len(model_options) > 0:
+if best_model_name in fitted_models:
     horizons = [1, 3, 6, 12] if agg_mode == "Сар" else [7, 14, 30, 90]
-    hs = horizon_scores(fitted_models[best_model_name], X_test_s, y_test_s, scaler_y, horizons)
+    bm, bsc = fitted_models[best_model_name]
+    hs = horizon_scores(bm, bsc, X_test_s, y_test, horizons)
     st.write("Horizon metrics:", hs)
 
-# -------------------------- Baselines (no retrain) --------------------------
+# -------------------------- Baselines --------------------------
 def naive_forecast(y): return np.roll(y, 1)[1:]
 def snaive_forecast(y, m): return np.roll(y, m)[m:]
 
-y_true_full = scaler_y.inverse_transform(y_test_s.reshape(-1,1)).ravel()
-y_hist = scaler_y.inverse_transform(y_train_s.reshape(-1,1)).ravel()
+y_true_full = y_test.ravel()
+y_hist = y_train.ravel()
 y_naive = naive_forecast(np.concatenate([y_hist, y_true_full]))[-len(y_true_full):]
 m_period = 12 if agg_mode == "Сар" else 7
 y_snaive = snaive_forecast(np.concatenate([y_hist, y_true_full]), m=m_period)[-len(y_true_full):]
@@ -927,7 +1019,7 @@ baseline_df = pd.DataFrame({
 })
 st.write("Baseline metrics:", baseline_df)
 
-# -------------------------- 1. Корреляцийн шинжилгээ --------------------------
+# -------------------------- 1. Корреляци --------------------------
 st.header("1. Осолд нөлөөлөх хүчин зүйлсийн тархалт/корреляцийн шинжилгээ")
 st.write("Доорх multiselect-оос ихдээ 15 хувьсагч сонгож корреляцийн матрицыг үзнэ үү.")
 
@@ -939,10 +1031,7 @@ vars_for_corr = list(dict.fromkeys(vars_for_corr))
 if len(vars_for_corr) > 1:
     Xx = df[vars_for_corr].fillna(0.0).values
     yy = pd.to_numeric(df["Осол"], errors="coerce").fillna(0).values
-    try:
-        rf_cor = RandomForestRegressor(n_estimATORS=200, random_state=RANDOM_STATE, n_jobs=-1)
-    except TypeError:
-        rf_cor = RandomForestRegressor(n_estimators=200, random_state=RANDOM_STATE, n_jobs=-1)
+    rf_cor = RandomForestRegressor(n_estimators=200, random_state=RANDOM_STATE, n_jobs=-1)
     rf_cor.fit(Xx, yy)
     importances_cor = rf_cor.feature_importances_
     indices_cor = np.argsort(importances_cor)[::-1]
@@ -958,7 +1047,7 @@ if selected_cols:
 else:
     st.info("Хувьсагч сонгоно уу.")
 
-# -------------------------- 2. Ослын өсөлтийн тренд --------------------------
+# -------------------------- 2. Тренд --------------------------
 st.header("2. Ослын өсөлтийн тренд")
 st.subheader("Жил, сар бүрийн ослын тоо")
 trend_data = (
@@ -976,7 +1065,7 @@ fig.update_layout(xaxis_tickangle=45, hovermode="x unified", plot_bgcolor="white
 fig.update_traces(line=dict(width=3))
 st.plotly_chart(fig, use_container_width=True)
 
-# -------------------------- 4. Категори хамаарал (Cramér’s V + Chi-square) --------------------------
+# -------------------------- 4. Категори хамаарал --------------------------
 st.header("4. Категори хувьсагчдын хоорондын хамаарал (Cramér’s V болон Chi-square)")
 low_card_cols = []
 for c in df.columns:
@@ -1025,7 +1114,7 @@ st.write("**p-value:**", round(p, 4))
 st.write("**Cramér’s V:**", round(cramers_v, 3))
 st.dataframe(table, use_container_width=True)
 
-# -------------------------- 6. Empirical Bayes (сар бүр) --------------------------
+# -------------------------- 6. Empirical Bayes --------------------------
 st.header("6. Empirical Bayes before–after шинжилгээ (сар бүр)")
 def empirical_bayes(obs, exp, prior_mean, prior_var):
     weight = prior_var / (prior_var + exp) if (prior_var + exp) > 0 else 0.0
@@ -1054,33 +1143,8 @@ fig = px.line(monthly, x="date", y=["osol_count","EB"], color="period", markers=
               title="Ослын сар бүрийн тоо (EB жигнэлт)")
 st.plotly_chart(fig, use_container_width=True)
 
+# (optional scorer kept)
 def neg_mae_real(y_true_s, y_pred_s):
-    y_t = scaler_y.inverse_transform(y_true_s.reshape(-1,1)).ravel()
-    y_p = scaler_y.inverse_transform(y_pred_s.reshape(-1,1)).ravel()
-    return -mean_absolute_error(y_t, y_p)
-
+    # not used in r4.0 flow, left for future CV pipelines
+    return -mean_absolute_error(y_true_s, y_pred_s)
 mae_real_scorer = make_scorer(neg_mae_real, greater_is_better=False)
-
-@st.cache_data(show_spinner=True)
-def select_top_exog_by_pi_cached(estimator, X_te, y_te, feature_cols, lag_cols, exog_cols,
-                                 top_k: int = 20, scoring="r2"):
-    exog_idx = [feature_cols.index(c) for c in exog_cols if c in feature_cols]
-    if len(exog_idx) == 0:
-        return pd.DataFrame(columns=["feature","importance","std"]), []
-    X_te_exog = X_te[:, exog_idx]
-    pi = permutation_importance(estimator, X_te_exog, y_te, n_repeats=20,
-                                random_state=RANDOM_STATE, scoring=scoring, n_jobs=-1)
-    df_pi = (pd.DataFrame({"feature": [exog_cols[i] for i in range(len(exog_idx))],
-                           "importance": pi.importances_mean,
-                           "std": pi.importances_std})
-                .sort_values("importance", ascending=False))
-    return df_pi, df_pi["feature"].head(min(top_k, len(exog_cols))).tolist()
-
-use_pi_for_fs = st.sidebar.checkbox("Feature selection-д PI ашиглах", value=False)
-if use_pi_for_fs:
-    df_pi, exog_top_pi = select_top_exog_by_pi_cached(
-        fitted_models[best_model_name], X_test_s, y_test_s, feature_cols, lag_cols, exog_cols,
-        top_k=top_k_exog, scoring="r2"
-    )
-    st.write("PI-д суурилсан top exogenous:")
-    st.dataframe(df_pi.head(30), use_container_width=True)
